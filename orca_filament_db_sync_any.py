@@ -6,7 +6,7 @@
 # name = "Filament DB Sync"
 # description = "Keeps OrcaSlicer's filament presets in step with Filament DB, in both directions."
 # author = "hyiger"
-# version = "0.1.0"
+# version = "0.1.1"
 # type = "script"
 # ///
 """Filament DB Sync -- two-way sync of filament presets between OrcaSlicer and Filament DB.
@@ -29,6 +29,7 @@ setting by setting, so a value that changed on both sides is refused rather than
 extra sync state needs to be kept. That only holds while the files match what OrcaSlicer loaded, so a
 reload that fails puts the old files back.
 """
+import http.client
 import json
 import os
 import re
@@ -121,6 +122,8 @@ NUMBER_LIST = re.compile(r"[+-]?\d*\.?\d+%?(,[+-]?\d*\.?\d+%?)*")
 UNSAFE_NAME_CHARACTERS = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 # OrcaSlicer starts a new thread for every click of a Run button.
 RUN_LOCK = threading.Lock()
+# OrcaSlicer asks in the background and denies the attempt that made it ask.
+PERMISSION_TEXT = "OrcaSlicer needs your permission to reach this address. Allow it, then run this again."
 
 
 class SyncError(Exception):
@@ -151,9 +154,7 @@ class Api:
             with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
                 return json.load(response)
         except PermissionError as error:
-            # OrcaSlicer asks in the background and denies this first attempt.
-            raise SyncError("OrcaSlicer needs your permission to reach this address. "
-                            "Allow it, then run this again.") from error
+            raise SyncError(PERMISSION_TEXT) from error
         except urllib.error.HTTPError as error:
             if error.code == 404 and missing_ok:
                 return None
@@ -162,6 +163,11 @@ class Api:
             raise SyncError(f"Filament DB returned an error: {http_error_text(error)}") from error
         except (urllib.error.URLError, TimeoutError) as error:
             raise SyncError(f"Could not reach Filament DB at {self.url}. Is it running?") from error
+        # urllib wraps only the errors of sending the request: these come from a bad port or from the reply.
+        except http.client.InvalidURL as error:
+            raise SyncError(f"The Filament DB URL {self.url} is not valid. Check it in the plugin's config.") from error
+        except (http.client.HTTPException, ConnectionError) as error:
+            raise SyncError(f"Filament DB at {self.url} closed the connection before it answered.") from error
         except ValueError as error:
             raise SyncError(f"Filament DB at {self.url} sent a response that is not JSON.") from error
 
@@ -537,6 +543,12 @@ def has_hot_plate_row(api, filament_id):
     return any(row.get("bedType") == HOT_PLATE_ROW for row in record.get("bedTypeTemps") or [])
 
 
+def confirmed(question, title):
+    """Ask *question* with OK and Cancel. OrcaSlicer shows it in a label, where a lone & marks a shortcut key
+    and disappears, so names and values keep theirs."""
+    return orca.host.ui.message(question.replace("&", "&&"), title, "ok_cancel", "question") == "ok"
+
+
 def shown_value(value):
     if value is None:
         return "not set"
@@ -554,7 +566,7 @@ def confirm_send(name, sendable, theirs):
     if len(lines) > MAX_LISTED_CHANGES:
         lines[MAX_LISTED_CHANGES:] = [f"and {len(lines) - MAX_LISTED_CHANGES} more"]
     text = f'Send these changes to "{name}" in Filament DB?\n\n' + "\n".join(lines)
-    if orca.host.ui.message(text, SEND_NAME, "ok_cancel", "question") != "ok":
+    if not confirmed(text, SEND_NAME):
         raise SyncError("Nothing was sent.")
 
 

@@ -578,6 +578,13 @@ class TestSend:
             "filament_density: 1.24 -> 1.3\nnozzle_temperature: 215 -> 222"
         ]
 
+    def test_an_ampersand_shows_in_the_confirmation(self, app):
+        """OrcaSlicer's message dialog would take a lone & for a shortcut key and drop it."""
+        edit(app, PLAIN, filament_end_gcode="M117 A&B")
+        app.send()
+        assert app.orca.host.ui.dialogs[0].endswith("filament_end_gcode: not set -> M117 A&&B")
+        assert app.db.posts == [{"filament_end_gcode": ["M117 A&B"]}]
+
     def test_declining_sends_nothing_and_keeps_the_edits(self, app):
         edit(app, PLAIN, nozzle_temperature="222")
         app.orca.host.ui.answer = "cancel"
@@ -794,6 +801,19 @@ class TestErrors:
     def test_a_response_that_is_not_json_is_explained(self, app):
         app.db.fail_with = (200, b"<html>", True)
         assert "not JSON" in app.pull().message
+
+    def test_a_dropped_connection_is_explained(self, app, plugin, monkeypatch):
+        """urllib wraps only errors in sending the request, not in reading the reply."""
+        def dropped(*args, **kwargs):
+            raise plugin.http.client.RemoteDisconnected("Remote end closed connection without response")
+
+        monkeypatch.setattr(plugin.urllib.request, "urlopen", dropped)
+        assert app.pull().message == f"Filament DB at {app.db.url} closed the connection before it answered."
+
+    def test_a_url_with_a_bad_port_is_explained(self, app):
+        app.config["url"] = "http://localhost:abc"
+        assert app.pull().message == ("The Filament DB URL http://localhost:abc is not valid. "
+                                      "Check it in the plugin's config.")
 
     def test_a_url_that_is_not_http_is_refused(self, app):
         app.config["url"] = "file:///etc/passwd"

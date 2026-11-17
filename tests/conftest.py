@@ -339,13 +339,17 @@ def fake_orca():
     module.register_capability = module.registered.append
     module.request_permissions = lambda **kwargs: setattr(module, "requested", kwargs)
     module.host = types.SimpleNamespace(
-        ui=types.SimpleNamespace(NotificationLevel=NotificationLevel, notifications=[], dialogs=[], answer="ok"),
+        ui=types.SimpleNamespace(NotificationLevel=NotificationLevel, notifications=[], dialogs=[], answer="ok",
+                                 while_open=None),
         preset=types.SimpleNamespace(),
     )
     module.host.ui.push_notification = lambda level, text: module.host.ui.notifications.append((level, text))
 
     def message(text, title, buttons, icon):
         module.host.ui.dialogs.append(text)
+        # Stands for whatever happens elsewhere while the dialog waits for an answer.
+        if module.host.ui.while_open:
+            module.host.ui.while_open()
         return module.host.ui.answer
 
     module.host.ui.message = message

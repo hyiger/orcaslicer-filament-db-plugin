@@ -599,10 +599,17 @@ def fetch_profiles(api, nozzle, filament_keys):
             for profile in api.request("/api/filaments/orcaslicer")]
 
 
+def exports_of(api, filament_id):
+    """Return the export of one filament, an empty list if Filament DB no longer has it."""
+    return api.request("/api/filaments/orcaslicer?ids=" + urllib.parse.quote(bare_id(filament_id)))
+
+
 def fetch_export(api, filament_id):
-    exported = api.request("/api/filaments/orcaslicer?ids=" + urllib.parse.quote(bare_id(filament_id)))
+    exported = exports_of(api, filament_id)
     if not exported:
-        raise SyncError("Filament DB no longer has this filament. Run Pull from Filament DB to remove it.")
+        # Pull refuses to remove a preset that has unsent edits, so they have to go first.
+        raise SyncError("Filament DB no longer has this filament. Discard the edits to it, "
+                        "then run Pull from Filament DB to remove its synced preset.")
     return exported[0]
 
 
@@ -724,15 +731,31 @@ def refuse_moved_edits(edited, presets):
                         "Discard them, then pull again. Nothing was changed.")
 
 
+def confirm_empty(api, bundle_dir):
+    """Ask before an empty export removes every synced preset.
+
+    An empty export is what deleting the last filament gives, but also what a plugin pointed at the wrong
+    copy of Filament DB gets. This comes before the check for unsent edits, which tells the user to
+    discard them, and that is the wrong advice when the copy is the wrong one.
+    """
+    count = len(list((bundle_dir / "filament").glob("*.json")))
+    if not count:
+        return
+    presets = "the 1 synced preset" if count == 1 else f"all {count} synced presets"
+    question = (f"Filament DB at {api.url} has no filaments. Remove {presets} from OrcaSlicer?\n\n"
+                "Press Cancel if the plugin is pointing at the wrong copy of Filament DB.")
+    if not confirmed(question, PULL_NAME):
+        raise SyncError("Filament DB has no filaments, and the synced presets were left alone.")
+
+
 def pull(api):
     bundle = orca.host.preset_bundle()
     filaments = bundle.filaments
     nozzle = active_nozzle(bundle)
     profiles = fetch_profiles(api, nozzle, set(filaments.edited_preset().config_keys()))
     bundle_dir = find_bundle_dir()
-    if not profiles and any((bundle_dir / "filament").glob("*.json")):
-        raise SyncError("Filament DB has no filaments, so the synced presets were left alone. "
-                        "Check that the plugin is pointing at the right copy.")
+    if not profiles:
+        confirm_empty(api, bundle_dir)
 
     in_use = {name.removeprefix(BUNDLE_PRESET_PREFIX) for name in bundle.current_filament_preset_names()
               if name.startswith(BUNDLE_PRESET_PREFIX)}
@@ -878,6 +901,11 @@ def send(api):
     presets = read_bundle(bundle_dir)
     stem = next((stem for stem, profile in presets.items() if profile["filament_id"] == filament_id), None)
     if stem is None:
+        # A pull removes a filament's synced preset once Filament DB drops it, but a saved copy stays,
+        # and telling the user to pull again would send them round in circles.
+        if not exports_of(api, filament_id):
+            raise SyncError(f'"{display_name(edited)}" came from a filament that Filament DB no longer has, '
+                            "so there is nowhere to send it.")
         raise SyncError("This filament has not been pulled yet. Run Pull from Filament DB first.")
     ancestor = presets[stem]
 

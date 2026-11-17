@@ -11,6 +11,8 @@ from conftest import (BUNDLE_ID, CALIBRATED_ID, MOVED_PREFIX, PLAIN_ID, PLATE_RO
 
 PLAIN = f"_local/{BUNDLE_ID}/Plain PLA"
 CALIBRATED = f"_local/{BUNDLE_ID}/Calibrated PLA"
+REMOVED_TEXT = ("Filament DB no longer has this filament. Discard the edits to it, "
+                "then run Pull from Filament DB to remove its synced preset.")
 
 
 def bundle_preset(app, name):
@@ -177,18 +179,6 @@ class TestPull:
         app.config["printer"] = "Prusa Core One INDX"
         app.pull()
         assert bundle_preset(app, "Calibrated PLA")["filament_flow_ratio"] == ["0.97"]
-
-    def test_an_empty_export_leaves_the_presets_alone(self, app):
-        app.pull()
-        app.db.filaments.clear()
-        result = app.pull()
-        assert result.status is PluginResult.Skipped
-        assert "has no filaments" in result.message
-        assert PLAIN in app.filaments.presets
-
-    def test_an_empty_export_is_fine_on_a_first_pull(self, app):
-        app.db.filaments.clear()
-        assert app.pull().message.startswith("Pulled 0 filaments")
 
     def test_reports_a_removed_filament_that_was_in_use(self, app):
         app.pull()
@@ -430,6 +420,81 @@ def preset_stems(app):
     return sorted(path.stem for path in (app.bundle_dir / "filament").glob("*.json"))
 
 
+class TestAnEmptyFilamentDb:
+    """An empty export can mean the last filament was deleted, or that the plugin points at the wrong copy."""
+
+    def emptied(self, app):
+        app.pull()
+        app.db.filaments.clear()
+        app.orca.host.ui.dialogs.clear()
+
+    def test_asks_before_removing_the_presets(self, app):
+        self.emptied(app)
+        app.pull()
+        assert app.orca.host.ui.dialogs == [
+            f"Filament DB at {app.db.url} has no filaments. Remove all 2 synced presets from OrcaSlicer?\n\n"
+            "Press Cancel if the plugin is pointing at the wrong copy of Filament DB."]
+
+    def test_cancel_leaves_the_presets_alone(self, app):
+        self.emptied(app)
+        app.orca.host.ui.answer = "cancel"
+        result = app.pull()
+        assert result.status is PluginResult.Skipped
+        assert result.message == "Filament DB has no filaments, and the synced presets were left alone."
+        assert PLAIN in app.filaments.presets
+        assert preset_stems(app) == ["Calibrated PLA", "Plain PLA"]
+        assert app.bundles.reloads == 1
+
+    def test_ok_removes_the_presets(self, app):
+        self.emptied(app)
+        result = app.pull()
+        assert result.status is PluginResult.Success
+        assert result.message == "Pulled 0 filaments from Filament DB for a 0.4 mm nozzle."
+        assert preset_stems(app) == []
+        assert not {PLAIN, CALIBRATED} & set(app.filaments.presets)
+
+    def test_names_a_single_preset_as_one(self, app):
+        app.pull()
+        del app.db.filaments[PLAIN_ID]
+        app.pull()
+        app.db.filaments.clear()
+        app.orca.host.ui.answer = "cancel"
+        app.pull()
+        assert "Remove the 1 synced preset from OrcaSlicer?" in app.orca.host.ui.dialogs[-1]
+
+    def test_a_first_pull_asks_nothing(self, app):
+        app.db.filaments.clear()
+        assert app.pull().message.startswith("Pulled 0 filaments")
+        assert not app.orca.host.ui.dialogs
+
+    def test_counts_and_removes_a_file_it_cannot_read(self, app):
+        self.emptied(app)
+        (app.bundle_dir / "filament" / "Plain PLA.json").write_text("{", encoding="utf-8")
+        app.pull()
+        assert "Remove all 2 synced presets" in app.orca.host.ui.dialogs[0]
+        assert preset_stems(app) == []
+
+    def test_unsent_edits_still_stop_the_removal_once_confirmed(self, app):
+        """The question comes first, so that edits are not discarded over a pull from the wrong copy."""
+        self.emptied(app)
+        app.filaments.select(PLAIN, {"nozzle_temperature": "222"})
+        result = app.pull()
+        assert len(app.orca.host.ui.dialogs) == 1
+        assert result.message == ('"Plain PLA" has unsent edits, and it was removed from Filament DB. '
+                                  "Discard them, then pull again. Nothing was changed.")
+        assert preset_stems(app) == ["Calibrated PLA", "Plain PLA"]
+        app.filaments.select(PLAIN)
+        app.pull()
+        assert preset_stems(app) == []
+
+    def test_cancel_with_unsent_edits_keeps_them(self, app):
+        self.emptied(app)
+        app.filaments.select(PLAIN, {"nozzle_temperature": "222"})
+        app.orca.host.ui.answer = "cancel"
+        assert app.pull().message == "Filament DB has no filaments, and the synced presets were left alone."
+        assert app.filaments.edited.config_value("nozzle_temperature") == "222"
+
+
 class TestLongNames:
     """A file name holds at most 255 bytes on common file systems, and the preset is written to its
     name plus .tmp first. Windows counts UTF-16 units instead, of which a name never has more than bytes."""
@@ -626,11 +691,12 @@ class TestAFileNameStaysWithItsFilament:
         assert app.pull().message == "Pulled 2 filaments from Filament DB for a 0.4 mm nozzle."
         assert bundle_ids(app) == {"Calibrated PLA": CALIBRATED_ID, "Plain PLA": PLAIN_ID}
 
-    def test_a_pull_still_leaves_files_it_cannot_read_alone_when_filament_db_is_empty(self, app):
+    def test_a_file_it_cannot_read_still_asks_when_filament_db_is_empty(self, app):
         app.pull()
         (app.bundle_dir / "filament" / "Plain PLA.json").write_text("{", encoding="utf-8")
         (app.bundle_dir / "filament" / "Calibrated PLA.json").unlink()
         app.db.filaments.clear()
+        app.orca.host.ui.answer = "cancel"
         assert "Filament DB has no filaments" in app.pull().message
         assert preset_stems(app) == ["Plain PLA"]
 
@@ -754,6 +820,7 @@ class TestSend:
 
     def test_a_filament_that_was_never_pulled_is_refused(self, app, plugin):
         app.pull()
+        app.db.filaments["c" * 24] = {**app.db.filaments[PLAIN_ID], "name": "New PLA"}
         path = plugin.data_dir_for_test / "user" / "Copy.json"
         path.write_text(json.dumps({"filament_id": "fdb_" + "c" * 24}))
         app.filaments.edited = FakePreset("Copy", path)
@@ -762,7 +829,19 @@ class TestSend:
     def test_a_filament_deleted_in_filament_db_is_reported(self, app):
         edit(app, PLAIN, nozzle_temperature="222")
         del app.db.filaments[PLAIN_ID]
-        assert "no longer has this filament" in app.send().message
+        assert app.send().message == REMOVED_TEXT
+
+    @pytest.mark.parametrize("emptied", [False, True])
+    def test_the_advice_for_a_deleted_filament_removes_its_preset(self, app, emptied):
+        """Pull refuses a preset with unsent edits, and asks first when Filament DB has nothing left."""
+        edit(app, PLAIN, nozzle_temperature="222")
+        app.db.filaments.pop(PLAIN_ID)
+        if emptied:
+            app.db.filaments.clear()
+        app.send()
+        app.filaments.select(PLAIN)
+        assert app.pull().status is PluginResult.Success
+        assert "Plain PLA" not in preset_stems(app)
 
     def saved_copy(self, app, plugin, **differences):
         """A preset saved under a new name, which keeps the filament's id and nothing else in common."""
@@ -784,6 +863,19 @@ class TestSend:
         app.filaments.select("Edited Plain PLA", {"filament_density": "1.35"})
         assert app.send().message == "Sent 1 of 1 edits to Filament DB."
         assert app.db.posts == [{"density": "1.35"}]
+
+    def test_a_saved_copy_of_a_removed_filament_is_not_sent_back_to_pull(self, app, plugin):
+        """Following the advice to discard and pull removes the synced preset, and pulling again cannot help."""
+        app.pull()
+        self.saved_copy(app, plugin)
+        app.filaments.select("Edited Plain PLA", {"filament_density": "1.35"})
+        del app.db.filaments[PLAIN_ID]
+        assert app.send().message == REMOVED_TEXT
+        assert app.pull().message.startswith("Pulled 1 filaments")
+        app.filaments.select("Edited Plain PLA", {"filament_density": "1.35"})
+        assert app.send().message == ('"Edited Plain PLA" came from a filament that Filament DB no longer has, '
+                                      "so there is nowhere to send it.")
+        assert not app.db.posts
 
     def test_a_synced_preset_is_judged_by_its_file_not_its_loaded_value(self, app):
         """OrcaSlicer's form of a value can differ from the file's, and only a copy needs this check."""
@@ -1166,8 +1258,7 @@ class TestChangesWhileConfirming:
     def test_a_filament_deleted_while_confirming_is_reported(self, app):
         edit(app, PLAIN, nozzle_temperature="222")
         app.orca.host.ui.while_open = lambda: app.db.filaments.pop(PLAIN_ID)
-        assert app.send().message == ("Filament DB no longer has this filament. "
-                                      "Run Pull from Filament DB to remove it.")
+        assert app.send().message == REMOVED_TEXT
         assert not app.db.posts
 
 

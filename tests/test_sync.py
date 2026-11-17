@@ -233,6 +233,47 @@ class TestPull:
         app.pull()
         assert sorted(path.stem for path in (app.bundle_dir / "filament").glob("*.json")) == ["A-B", "a-b (2)"]
 
+    @pytest.mark.parametrize("name, stem", [
+        ("NUL", "NUL_"),
+        ("con.PLA", "con_.PLA"),
+        ("Com1 . ", "Com1_"),
+        ("LPT9 .old", "LPT9_ .old"),
+        ("aux", "aux_"),
+        ("COM²", "COM²_"),
+        ("CONIN$", "CONIN$_"),
+        ("NULL", "NULL"),
+        ("COM10", "COM10"),
+        ("COM1 PLA", "COM1 PLA"),
+        ("Console.PLA", "Console.PLA"),
+    ])
+    def test_a_windows_device_name_is_not_used_as_a_file_name(self, app, name, stem):
+        """Windows opens the device for such a name, even with an extension after it."""
+        app.db.filaments[PLAIN_ID]["name"] = name
+        app.pull()
+        assert (app.bundle_dir / "filament" / f"{stem}.json").exists()
+
+    def test_a_device_name_pulled_before_is_moved_once(self, app):
+        """Earlier versions wrote "AUX" as it is, which works outside Windows. The next pull moves it to "AUX_",
+        and OrcaSlicer chooses another preset for a slot that had the old one."""
+        app.db.filaments[PLAIN_ID]["name"] = "AUX"
+        app.pull()
+        filament_dir = app.bundle_dir / "filament"
+        (filament_dir / "AUX_.json").rename(filament_dir / "AUX.json")
+        app.bundles.reload_local(BUNDLE_ID)
+        app.filaments.select(f"_local/{BUNDLE_ID}/AUX")
+        assert "chose other presets for them: AUX." in app.pull().message
+        assert preset_stems(app) == ["AUX_", "Calibrated PLA"]
+
+    def test_unsent_edits_on_a_device_name_pulled_before_are_kept(self, app):
+        app.db.filaments[PLAIN_ID]["name"] = "AUX"
+        app.pull()
+        filament_dir = app.bundle_dir / "filament"
+        (filament_dir / "AUX_.json").rename(filament_dir / "AUX.json")
+        app.bundles.reload_local(BUNDLE_ID)
+        app.filaments.select(f"_local/{BUNDLE_ID}/AUX", {"filament_vendor": "Maker"})
+        assert "has unsent edits" in app.pull().message
+        assert (filament_dir / "AUX.json").exists()
+
     def test_finds_the_active_users_folder_and_leaves_no_trace_in_others(self, app, plugin):
         app.pull()
         assert app.bundle_dir.is_dir()
@@ -306,8 +347,8 @@ class TestPull:
     def test_adding_a_filament_does_not_move_an_existing_preset(self, app, plugin):
         first = {"name": "A:B", "filament_id": "fdb_1"}
         added = {"name": "A/B", "filament_id": "fdb_2"}  # sorts first by name, but it came later
-        assert plugin.preset_files([first]) == {"A-B": first}
-        assert plugin.preset_files([added, first]) == {"A-B": first, "A-B (2)": added}
+        assert plugin.preset_files([first], app.bundle_dir) == {"A-B": first}
+        assert plugin.preset_files([added, first], app.bundle_dir) == {"A-B": first, "A-B (2)": added}
 
     def test_a_refused_reload_puts_the_old_files_back(self, app):
         """The files are the conflict check's ancestor, so they must match what OrcaSlicer loaded."""
@@ -383,6 +424,78 @@ class TestPull:
         app.pull()
         active[0] = False
         assert not seen
+
+
+def preset_stems(app):
+    return sorted(path.stem for path in (app.bundle_dir / "filament").glob("*.json"))
+
+
+class TestLongNames:
+    """A file name holds at most 255 bytes on common file systems, and the preset is written to its
+    name plus .tmp first. Windows counts UTF-16 units instead, of which a name never has more than bytes."""
+
+    @staticmethod
+    def assert_fits(app):
+        for path in (app.bundle_dir / "filament").glob("*.json"):
+            assert len((path.name + ".tmp").encode("utf-8")) <= 255
+
+    # The leading x puts the cut in the middle of a character.
+    @pytest.mark.parametrize("name", ["P" * 256, "xé" + "é" * 200, "x" + "日本" * 50])
+    def test_a_long_name_does_not_stop_the_pull(self, app, name):
+        app.pull()
+        app.db.filaments[PLAIN_ID]["name"] = name
+        app.db.filaments[CALIBRATED_ID]["temperatures"]["nozzle"] = 235
+        assert app.pull().status is PluginResult.Success
+        assert app.filaments.presets[CALIBRATED].config_value("nozzle_temperature") == "235"
+        self.assert_fits(app)
+        [stem] = [stem for stem in preset_stems(app) if stem != "Calibrated PLA"]
+        # The cut keeps whole characters, and marks the name as cut short.
+        assert name.startswith(stem.rpartition("… ")[0])
+        assert len(stem.encode("utf-8")) > 200
+
+    def test_a_name_that_fits_is_kept_whole(self, app):
+        name = "é" * 123  # 246 bytes, and 255 with .json.tmp
+        app.db.filaments[PLAIN_ID]["name"] = name
+        app.pull()
+        assert name in preset_stems(app)
+
+    def test_long_names_sharing_a_start_stay_apart_and_keep_their_file_names(self, app):
+        app.db.filaments[PLAIN_ID]["name"] = "P" * 300 + " red"
+        app.db.filaments[CALIBRATED_ID]["name"] = "P" * 300 + " blue"
+        app.pull()
+        stems = preset_stems(app)
+        assert len(stems) == 2 and not any(stem.endswith(")") for stem in stems)
+        app.pull()
+        assert preset_stems(app) == stems
+        self.assert_fits(app)
+
+    def test_the_same_long_name_twice_is_numbered_and_still_fits(self, app):
+        app.db.filaments[PLAIN_ID]["name"] = app.db.filaments[CALIBRATED_ID]["name"] = "P" * 300
+        app.pull()
+        first, second = preset_stems(app)
+        assert second.endswith(" (2)") and second.removesuffix(" (2)").endswith(first[-10:])
+        self.assert_fits(app)
+
+    # The emoji are 4 bytes and 2 UTF-16 units each, so this name fits in 255 bytes but not in the room left.
+    @pytest.mark.parametrize("name", ["P" * 200, "x" + "😀" * 60])
+    def test_on_windows_the_folder_takes_room_from_the_file_name(self, app, monkeypatch, name):
+        """OrcaSlicer is not marked as long path aware, so Windows holds it to 259 units in a whole path."""
+        filament_dir = app.bundle_dir / "filament"
+        monkeypatch.setattr(app.plugin, "MAX_PATH_UNITS", len(str(filament_dir)) + 1 + 100)
+        app.db.filaments[PLAIN_ID]["name"] = name
+        assert app.pull().status is PluginResult.Success
+        for path in filament_dir.glob("*.json"):
+            assert len(str(path).encode("utf-16-le")) // 2 + len(".tmp") <= app.plugin.MAX_PATH_UNITS
+        [stem] = [stem for stem in preset_stems(app) if stem != "Calibrated PLA"]
+        assert name.startswith(stem.rpartition("… ")[0]) and len(stem.encode("utf-16-le")) // 2 > 80
+
+    def test_a_long_name_can_be_edited_and_sent(self, app):
+        app.db.filaments[PLAIN_ID]["name"] = "P" * 300
+        app.pull()
+        [stem] = [stem for stem in preset_stems(app) if stem != "Calibrated PLA"]
+        edit(app, f"_local/{BUNDLE_ID}/{stem}", filament_vendor="Maker")
+        assert app.send().message == "Sent 1 of 1 edits to Filament DB."
+        assert app.db.posts == [{"vendor": "Maker"}]
 
 
 class TestSend:

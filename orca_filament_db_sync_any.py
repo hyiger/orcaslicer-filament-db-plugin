@@ -29,6 +29,7 @@ setting by setting, so a value that changed on both sides is refused rather than
 extra sync state needs to be kept. That only holds while the files match what OrcaSlicer loaded, so a
 reload that fails puts the old files back.
 """
+import hashlib
 import http.client
 import json
 import os
@@ -145,6 +146,16 @@ QUOTED_STRING = re.compile(r'"((?:[^"\\]|\\.)*)"', re.DOTALL)
 STRING_ITEM = re.compile(QUOTED_STRING.pattern + r'|([^";]*)', re.DOTALL)
 # A file name cannot hold these on every platform, and a preset takes its name from its file.
 UNSAFE_NAME_CHARACTERS = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
+# Windows opens a device for these names, also with an extension or spaces after them.
+WINDOWS_DEVICE_NAME = re.compile(r"(?:CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|COM[0-9¹²³]|LPT[0-9¹²³])(?= *(?:\.|$))",
+                                 re.IGNORECASE)
+# Common file systems allow 255 bytes in a file name, and a preset is first written to its name plus this.
+# Windows counts UTF-16 units instead, of which a name never has more than it has UTF-8 bytes.
+MAX_FILE_NAME_BYTES = 255
+TEMPORARY_SUFFIX = ".json.tmp"
+# On Windows a whole path is held to 259 UTF-16 units unless the program's manifest asks for long paths.
+# OrcaSlicer's does not, and the plugin runs inside it, so the folder takes room from the file name.
+MAX_PATH_UNITS = 259 if os.name == "nt" else None
 # OrcaSlicer starts a new thread for every click of a Run button.
 RUN_LOCK = threading.Lock()
 # OrcaSlicer asks in the background and denies the attempt that made it ask.
@@ -298,13 +309,46 @@ def find_bundle_dir():
     raise SyncError("Could not find the active user's preset folder.")
 
 
-def preset_stem(name, taken):
+def utf16_units(text):
+    return len(text.encode("utf-16-le")) // 2
+
+
+def file_name_room(filament_dir):
+    """Return how many UTF-16 units a file name in *filament_dir* can have, the temporary suffix included."""
+    if MAX_PATH_UNITS is None:
+        return MAX_FILE_NAME_BYTES
+    return min(MAX_FILE_NAME_BYTES, MAX_PATH_UNITS - utf16_units(str(filament_dir)) - 1)
+
+
+def fitted(stem, name, suffix, room):
+    """Return *stem* and *suffix*, with the stem cut short if the file name would be too long.
+
+    A cut ends with a short hash of the whole *name*, so that two long names that start alike still
+    get different file names, and the same ones on every pull. The cut never splits a character.
+    """
+    def fits(text):
+        whole = text + suffix + TEMPORARY_SUFFIX
+        return len(whole.encode("utf-8")) <= MAX_FILE_NAME_BYTES and utf16_units(whole) <= room
+
+    if fits(stem):
+        return stem + suffix
+    mark = f"… {hashlib.sha256(name.encode('utf-8')).hexdigest()[:8]}"
+    # Every character takes at least a byte, so no more than this many can fit.
+    cut = stem[:MAX_FILE_NAME_BYTES]
+    while cut and not fits(cut + mark):
+        cut = cut[:-1]
+    return cut.rstrip(" .") + mark + suffix
+
+
+def preset_stem(name, taken, room):
     """Return a file name for the preset called *name* that does not collide with those in *taken*."""
     stem = UNSAFE_NAME_CHARACTERS.sub("-", name).strip(" .") or "Filament"
-    candidate, number = stem, 1
+    if device := WINDOWS_DEVICE_NAME.match(stem):
+        stem = stem[:device.end()] + "_" + stem[device.end():]
+    candidate, number = fitted(stem, name, "", room), 1
     while candidate.casefold() in taken:
         number += 1
-        candidate = f"{stem} ({number})"
+        candidate = fitted(stem, name, f" ({number})", room)
     taken.add(candidate.casefold())
     return candidate
 
@@ -324,10 +368,10 @@ def write_json(path, content):
     write_file(path, json.dumps(content, indent=2, ensure_ascii=False).encode("utf-8"))
 
 
-def preset_files(profiles):
+def preset_files(profiles, filament_dir):
     """Return {stem: profile}. Going by id keeps a stem with its filament when others come and go."""
-    taken = set()
-    return {preset_stem(profile["name"], taken): profile
+    taken, room = set(), file_name_room(filament_dir)
+    return {preset_stem(profile["name"], taken, room): profile
             for profile in sorted(profiles, key=lambda profile: profile["filament_id"])}
 
 
@@ -632,7 +676,7 @@ def pull(api):
         raise SyncError("Filament DB has no filaments, so the synced presets were left alone. "
                         "Check that the plugin is pointing at the right copy.")
 
-    presets = preset_files(profiles)
+    presets = preset_files(profiles, bundle_dir / "filament")
     refuse_moved_edits(filaments.edited_preset(), presets)
     replaced = sorted(name.removeprefix(BUNDLE_PRESET_PREFIX) for name in set(bundle.current_filament_preset_names())
                       if name.startswith(BUNDLE_PRESET_PREFIX)

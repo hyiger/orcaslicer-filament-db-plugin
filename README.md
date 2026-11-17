@@ -39,6 +39,7 @@ These are in the Config tab of **Pull from Filament DB**.
 - **Syncing is by command.** Nothing happens until you run one, and a change made in Filament DB does not appear by itself.
 - **Filaments deleted in OrcaSlicer are not deleted in Filament DB,** and a new filament made in OrcaSlicer cannot be sent. Create it in Filament DB.
 - **Filament DB's template filaments are not pulled,** because its export leaves them out.
+- **A preset's name can differ a little from the filament's,** because OrcaSlicer names a preset after its file, and some names cannot be file names everywhere. Characters such as `/` and `:` become `-`, a Windows device name such as `NUL` or `COM1` gets a `_` after it, and a name too long for a file name is cut short and ends with a short code that keeps it apart from names that start the same way. On Windows the path of the preset folder counts too, because OrcaSlicer cannot use a path longer than 259 characters there, so a name can be cut sooner. Two names that end up alike get a number, such as `(2)`. A preset that an earlier version pulled under a device name moves to its new name on the next pull: send or discard its unsent edits first, then select it again.
 
 ## How filaments imported from PrusaSlicer are handled
 

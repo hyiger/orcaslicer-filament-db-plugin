@@ -725,6 +725,23 @@ def load_back(api, filament_id, calibration, filament_keys, bundle_dir, presets,
     return theirs
 
 
+def synced_values(filaments, stem, keys, theirs):
+    """What the synced preset shows for *keys*: Filament DB's value, or OrcaSlicer's own where it has none."""
+    shown = {key: theirs[key] for key in keys if key in theirs}
+    unexported = [key for key in keys if key not in theirs]
+    if not unexported:
+        # Only a setting Filament DB leaves out needs the loaded preset, so a send that has none
+        # does not depend on OrcaSlicer having loaded it.
+        return shown
+    synced = filaments.find_preset(BUNDLE_PRESET_PREFIX + stem)
+    # The bundle's files can be on disk without OrcaSlicer having loaded them, and then there is
+    # nothing to compare the copy with.
+    if synced is None:
+        raise SyncError("Nothing was sent, because OrcaSlicer has not loaded this filament's synced preset. "
+                        "Run Pull from Filament DB, then send again.")
+    return {**shown, **{key: decode_value(key, synced.config_value(key) or "") for key in unexported}}
+
+
 def send(api):
     bundle = orca.host.preset_bundle()
     filaments = bundle.filaments
@@ -766,15 +783,9 @@ def send(api):
         # about what the user could see when making this edit. A setting Filament DB leaves out is not
         # a missing value: the synced preset shows OrcaSlicer's own for it, and a copy saved before an
         # override was removed still shows the old one.
-        synced = filaments.find_preset(BUNDLE_PRESET_PREFIX + stem)
-        # The bundle's files can be on disk without OrcaSlicer having loaded them, and then there is
-        # nothing to compare the copy with.
-        if synced is None:
-            raise SyncError("Nothing was sent, because OrcaSlicer has not loaded this filament's synced preset. "
-                            "Run Pull from Filament DB, then send again.")
+        shown = synced_values(filaments, stem, posting, theirs)
         hidden = [key for key in posting
-                  if not same_value(theirs[key] if key in theirs else decode_value(key, synced.config_value(key) or ""),
-                                    decode_value(key, selected.config_value(key) or ""))]
+                  if not same_value(shown[key], decode_value(key, selected.config_value(key) or ""))]
         if hidden:
             raise SyncError(f"Nothing was sent, because the synced preset shows other values for: {key_list(hidden)}. "
                             "Make the change on the synced preset instead.")

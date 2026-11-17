@@ -1,10 +1,12 @@
+import io
 import json
 import sys
+import urllib.request
 import threading
 
 import pytest
 
-from conftest import BUNDLE_ID, CALIBRATED_ID, PLAIN_ID, FakePreset, NotificationLevel, PluginResult
+from conftest import BUNDLE_ID, CALIBRATED_ID, MOVED_PREFIX, PLAIN_ID, FakePreset, NotificationLevel, PluginResult
 
 PLAIN = f"_local/{BUNDLE_ID}/Plain PLA"
 CALIBRATED = f"_local/{BUNDLE_ID}/Calibrated PLA"
@@ -807,7 +809,7 @@ class TestErrors:
         def dropped(*args, **kwargs):
             raise plugin.http.client.RemoteDisconnected("Remote end closed connection without response")
 
-        monkeypatch.setattr(plugin.urllib.request, "urlopen", dropped)
+        monkeypatch.setattr(plugin.urllib.request.OpenerDirector, "open", dropped)
         assert app.pull().message == f"Filament DB at {app.db.url} closed the connection before it answered."
 
     def test_a_url_with_a_bad_port_is_explained(self, app):
@@ -832,7 +834,7 @@ class TestErrors:
         def denied(*args, **kwargs):
             raise PermissionError("audit permission required")
 
-        monkeypatch.setattr(plugin.urllib.request, "urlopen", denied)
+        monkeypatch.setattr(plugin.urllib.request.OpenerDirector, "open", denied)
         assert "needs your permission" in app.pull().message
 
     def test_a_file_permission_error_is_not_mistaken_for_a_network_prompt(self, app, plugin, monkeypatch):
@@ -861,6 +863,109 @@ class TestErrors:
         result = app.pull()
         assert result.status is PluginResult.Skipped
         assert result.message == "Filament DB Sync failed: Local bundle contains an invalid preset"
+
+
+DUMMY_KEY = "dummy-key-not-a-secret"
+
+
+def with_key(app):
+    app.db.api_key = DUMMY_KEY
+    app.config["api_key"] = DUMMY_KEY
+
+
+def redirect(plugin, configured, target, key=DUMMY_KEY, response=None):
+    """Ask the plugin's redirect policy what it would send to *target*, without needing TLS."""
+    request = urllib.request.Request(configured + "/api/filaments/orcaslicer",
+                                     headers={"Authorization": f"Bearer {key}"} if key else {})
+    handler = plugin.SameOriginRedirects(configured)
+    return handler.redirect_request(request, response or io.BytesIO(), 302, "Found", {}, target)
+
+
+class TestRedirects:
+    """The API key goes only to the scheme, host and port it was configured for."""
+
+    def test_a_redirect_within_the_origin_keeps_the_api_key(self, app):
+        with_key(app)
+        app.config["url"] = app.db.url + MOVED_PREFIX
+        assert app.pull().status is PluginResult.Success
+        assert app.db.authorizations and set(app.db.authorizations) == {f"Bearer {DUMMY_KEY}"}
+
+    def test_a_chain_of_redirects_within_the_origin_keeps_the_api_key(self, app):
+        with_key(app)
+        app.config["url"] = app.db.url + MOVED_PREFIX + MOVED_PREFIX
+        assert app.pull().status is PluginResult.Success
+
+    def test_a_redirect_to_another_port_is_not_followed(self, app, foreign):
+        with_key(app)
+        foreign.api_key = DUMMY_KEY
+        app.config["url"] = app.db.url + MOVED_PREFIX
+        app.db.moved_to = foreign.url
+        message = app.pull().message
+        assert message.startswith(f"Filament DB at {app.config['url']} redirected to {foreign.url}, which was not followed")
+        assert foreign.authorizations == []
+
+    def test_a_redirect_to_another_host_name_is_not_followed(self, app):
+        """localhost and 127.0.0.1 reach the same server here, but are different origins."""
+        with_key(app)
+        app.config["url"] = app.db.url + MOVED_PREFIX
+        app.db.moved_to = app.db.url.replace("127.0.0.1", "localhost")
+        assert "which was not followed" in app.pull().message
+        assert app.db.authorizations == []
+
+    def test_a_hop_back_to_the_origin_is_never_reached(self, app, foreign):
+        """Once off the origin, nothing that follows can be trusted to send the key home again."""
+        with_key(app)
+        app.config["url"] = app.db.url + MOVED_PREFIX
+        app.db.moved_to = foreign.url + MOVED_PREFIX
+        foreign.moved_to = app.db.url
+        assert "which was not followed" in app.pull().message
+        assert foreign.authorizations == app.db.authorizations == []
+
+    def test_a_redirect_to_a_port_that_is_not_a_number_is_not_followed(self, app):
+        with_key(app)
+        app.config["url"] = app.db.url + MOVED_PREFIX
+        app.db.moved_to = "http://127.0.0.1:abc"
+        assert "redirected to http://127.0.0.1:abc, which was not followed" in app.pull().message
+
+    def test_without_an_api_key_a_redirect_elsewhere_is_still_followed(self, app, foreign):
+        app.config["url"] = app.db.url + MOVED_PREFIX
+        app.db.moved_to = foreign.url
+        assert app.pull().status is PluginResult.Success
+        assert foreign.authorizations and set(foreign.authorizations) == {None}
+
+    @pytest.mark.parametrize("configured, target", [
+        ("https://db.example", "http://db.example/api"),  # a downgrade would send the key in the clear
+        ("http://db.example", "https://db.example/api"),  # an upgrade is still another origin
+        ("https://db.example", "https://db.example:8443/api"),
+        ("https://db.example", "https://other.example/api"),
+        # urllib would dial "x@127.0.0.1", and on some networks any machine can answer to that name
+        ("http://127.0.0.1:3456", "http://x@127.0.0.1:3456/api"),
+        ("http://127.0.0.1:3456", "http://x%2f@127.0.0.1:3456/api"),
+        ("http://x@127.0.0.1:3456", "http://x@127.0.0.1:3456/api"),  # unknown never matches unknown
+    ])
+    def test_another_origin_never_gets_the_api_key(self, plugin, configured, target):
+        response = io.BytesIO(b"Moved")
+        with pytest.raises(plugin.SyncError, match="which was not followed"):
+            redirect(plugin, configured, target, response=response)
+        assert response.closed
+
+    @pytest.mark.parametrize("configured, target", [
+        ("https://db.example", "https://DB.Example:443/api"),
+        ("http://db.example:80", "http://db.example/api"),
+        ("http://127.0.0.1:3456", "http://127.0.0.1:3456/api"),
+    ])
+    def test_the_same_origin_keeps_the_api_key(self, plugin, configured, target):
+        assert redirect(plugin, configured, target).get_header("Authorization") == f"Bearer {DUMMY_KEY}"
+
+    def test_a_request_without_a_key_may_change_origin(self, plugin):
+        assert redirect(plugin, "https://db.example", "http://other.example/api", key="").full_url == (
+            "http://other.example/api")
+
+    def test_the_refusal_shows_neither_the_path_nor_credentials_of_the_target(self, plugin):
+        with pytest.raises(plugin.SyncError) as refusal:
+            redirect(plugin, "https://db.example", "https://user:hunter2@evil.example/collect?token=abc")
+        assert "redirected to https://evil.example," in str(refusal.value)
+        assert "hunter2" not in str(refusal.value) and "token" not in str(refusal.value)
 
 
 class TestValues:

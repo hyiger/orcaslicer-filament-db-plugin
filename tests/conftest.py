@@ -30,9 +30,10 @@ FILAMENT_KEYS = [
     "enable_pressure_advance", "eng_plate_temp", "eng_plate_temp_initial_layer", "fan_cooling_layer_time",
     "fan_max_speed", "fan_min_speed", "filament_cost", "filament_density", "filament_deretraction_speed",
     "filament_diameter", "filament_end_gcode", "filament_flow_ratio", "filament_max_volumetric_speed",
-    "filament_notes", "filament_ramming_parameters", "filament_retraction_length", "filament_retraction_speed",
-    "filament_settings_id", "filament_shrink", "filament_shrinkage_compensation_z", "filament_type",
-    "filament_vendor", "filament_z_hop", "hot_plate_temp", "hot_plate_temp_initial_layer", "inherits",
+    "filament_notes", "filament_plugin_config_overrides", "filament_ramming_parameters",
+    "filament_retraction_length", "filament_retraction_speed", "filament_settings_id", "filament_shrink", "filament_shrinkage_compensation_z", "filament_type",
+    "filament_vendor", "filament_z_hop", "filament_z_hop_types", "hot_plate_temp", "hot_plate_temp_initial_layer",
+    "inherits",
     "nozzle_temperature", "nozzle_temperature_initial_layer", "nozzle_temperature_range_high",
     "nozzle_temperature_range_low", "pressure_advance", "slow_down_layer_time", "slow_down_min_speed",
     "supertack_plate_temp", "supertack_plate_temp_initial_layer", "textured_cool_plate_temp",
@@ -40,7 +41,8 @@ FILAMENT_KEYS = [
 ]
 # Known to the config definitions, but not filament settings, so a preset holding one is invalid.
 INVALID_IN_A_PRESET = {"filament_colour", "temperature"}
-NULLABLE_KEYS = {"filament_retraction_length", "filament_retraction_speed", "filament_deretraction_speed", "filament_z_hop"}
+NULLABLE_KEYS = {"filament_retraction_length", "filament_retraction_speed", "filament_deretraction_speed",
+                 "filament_z_hop", "filament_z_hop_types"}
 # A path under this answers with a redirect, the way a server that moved or sits behind a proxy does.
 MOVED_PREFIX = "/old"
 
@@ -69,10 +71,24 @@ class NotificationLevel(enum.Enum):
     WarningNotificationLevel = 1
 
 
-def serialized(value):
-    """Format a preset file value the way Preset.config_value() returns it."""
-    item = value[0]
-    return f'"{item}"' if " " in item or "\n" in item else item
+# The string lists among FILAMENT_KEYS, from PrintConfig.cpp in OrcaSlicer. The rest are numbers.
+STRING_KEYS = {
+    "compatible_printers", "compatible_prints", "default_filament_colour", "filament_end_gcode", "filament_notes",
+    "filament_ramming_parameters", "filament_settings_id", "filament_type", "filament_vendor",
+}
+
+
+def serialized(key, value):
+    """Format a preset file value the way Preset.config_value() returns it, as escape_strings_cstyle()
+    and the numeric vectors' serialize() in OrcaSlicer's Config.cpp and Config.hpp do."""
+    if key not in STRING_KEYS:
+        return ",".join(value)
+    items = []
+    for item in value:
+        if any(character in item for character in ' \t;\\"\r\n') or item == "" and len(value) == 1:
+            item = '"' + item.replace("\\", "\\\\").replace('"', '\\"').replace("\r", "\\r").replace("\n", "\\n") + '"'
+        items.append(item)
+    return ";".join(items)
 
 
 class FakePreset:
@@ -149,7 +165,7 @@ class FakeBundles:
             )
             if invalid:
                 raise RuntimeError("Local bundle contains an invalid preset")
-            values = {key: serialized(value) for key, value in profile.items() if isinstance(value, list)}
+            values = {key: serialized(key, value) for key, value in profile.items() if isinstance(value, list)}
             loaded[prefix + path.stem] = FakePreset(prefix + path.stem, path, values)
         selected = self.filaments.selected.name
         if selected.startswith(prefix) and selected not in loaded and self.filaments.edited.is_dirty:

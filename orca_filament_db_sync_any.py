@@ -67,7 +67,9 @@ SCOPE_KEYS = frozenset({
     "compatible_printers", "compatible_printers_condition", "compatible_prints", "compatible_prints_condition",
     "inherits",
 })
-UNSENT_KEYS = SCOPE_KEYS | {"filament_settings_id"}
+# filament_plugin_config_overrides holds this install's settings for its plugins, which can include an
+# API key like this plugin's own. It is not filament data, so it stays out of Filament DB.
+UNSENT_KEYS = SCOPE_KEYS | {"filament_settings_id", "filament_plugin_config_overrides"}
 Z_SHRINKAGE_KEY = "filament_shrinkage_compensation_z"
 MAX_VOLUMETRIC_SPEED_KEY = "filament_max_volumetric_speed"
 # PrusaSlicer's names for settings that mean the same here. OrcaSlicer has no such translation of its
@@ -119,7 +121,20 @@ HOT_PLATE_ROW = "Hot Plate"
 SINGLE_VALUE_KEYS = STRUCTURED_FIELDS.keys() | TEMPERATURE_FIELDS.keys()
 MAX_LISTED_CHANGES = 15
 MAX_SHOWN_VALUE_LENGTH = 40
-NUMBER_LIST = re.compile(r"[+-]?\d*\.?\d+%?(,[+-]?\d*\.?\d+%?)*")
+# The lists of strings in a filament preset, from OrcaSlicer's PrintConfig.cpp. The host hands values over
+# as text without their type, and OrcaSlicer writes these with semicolons between the values, quoting
+# one only when it holds a space, a semicolon, a quote, a backslash or a line break. Every other list is
+# numbers, percents, booleans or option names with commas between them, and nil where not overridden.
+STRING_LIST_KEYS = frozenset({
+    "adaptive_pressure_advance_model", "compatible_printers", "compatible_prints", "default_filament_colour",
+    "filament_change_extrusion_role_gcode", "filament_colour", "filament_colour_type",
+    "filament_dev_ams_drying_ams_limitations", "filament_end_gcode", "filament_extruder_variant", "filament_ids",
+    "filament_multi_colour", "filament_notes", "filament_ramming_parameters", "filament_settings_id",
+    "filament_start_gcode", "filament_type", "filament_vendor", "volumetric_speed_coefficients",
+})
+QUOTED_STRING = re.compile(r'"((?:[^"\\]|\\.)*)"', re.DOTALL)
+# One value of a list of strings: quoted, or bare up to the next semicolon.
+STRING_ITEM = re.compile(QUOTED_STRING.pattern + r'|([^";]*)', re.DOTALL)
 # A file name cannot hold these on every platform, and a preset takes its name from its file.
 UNSAFE_NAME_CHARACTERS = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 # OrcaSlicer starts a new thread for every click of a Run button.
@@ -391,9 +406,14 @@ def fetch_calibration(api, filament_id, nozzle):
     return {}
 
 
+def unescaped(text):
+    """Undo C escapes as OrcaSlicer and PrusaSlicer do, where only \\n and \\r stand for other characters."""
+    return re.sub(r"\\(.)", lambda escape: {"n": "\n", "r": "\r"}.get(escape[1], escape[1]), text, flags=re.DOTALL)
+
+
 def unquoted(value):
     """Undo the INI quoting that values imported from PrusaSlicer keep in Filament DB."""
-    return [decode_value(item)[0] if len(item) > 1 and item[0] == item[-1] == '"' else item for item in value]
+    return [unescaped(quoted[1]) if (quoted := QUOTED_STRING.fullmatch(item)) else item for item in value]
 
 
 def orca_z_shrinkage(value):
@@ -455,29 +475,38 @@ def fetch_export(api, filament_id):
     return exported[0]
 
 
-def decode_value(value):
-    """Turn a serialized config value into the list form of a preset file."""
-    if NUMBER_LIST.fullmatch(value):
-        return value.split(",")
-    if not value.startswith('"'):
-        return [value]
-    # Strings are double-quoted and C-escaped, and separated by semicolons.
-    items, current, position = [], [], 1
-    while position < len(value):
-        character = value[position]
-        if character == "\\":
-            position += 1
-            current.append({"n": "\n", "r": "\r", "t": "\t"}.get(value[position:position + 1], value[position:position + 1]))
-        elif character == '"':
-            items.append("".join(current))
-            current = []
-            position = value.find('"', position + 1)
-            if position < 0:
-                break
-        else:
-            current.append(character)
+def string_list(value):
+    """Split a list of strings as OrcaSlicer writes it, or return None if it is malformed.
+
+    A value is quoted only when it needs to be, so quoted and bare values can sit side by side.
+    """
+    items, position = [], 0
+    while True:
+        item = STRING_ITEM.match(value, position)
+        items.append(item[2] if item[1] is None else unescaped(item[1]))
+        position = item.end()
+        if position == len(value):
+            return items
+        # An unclosed quote, or something after a closing one, stops short of the next semicolon.
+        if value[position] != ";":
+            return None
         position += 1
-    return items
+
+
+def decode_value(key, value):
+    """Turn the serialized value of setting *key* into the list form of a preset file."""
+    # A quote or a semicolon never appears in a list of numbers or options, so a value holding one is a
+    # list of strings even when its setting is newer than STRING_LIST_KEYS.
+    if key not in STRING_LIST_KEYS and '"' not in value and ";" not in value:
+        return value.split(",")
+    items = string_list(value)
+    if items is not None:
+        return items
+    # OrcaSlicer never writes a list of strings this way, so outside STRING_LIST_KEYS the value is a
+    # single string setting, which is written as it is, with only its backslashes and line breaks escaped.
+    if key not in STRING_LIST_KEYS:
+        return [unescaped(value)]
+    raise SyncError(f"Nothing was sent, because OrcaSlicer's value for {key} could not be read.")
 
 
 def same_value(first, second):
@@ -500,7 +529,7 @@ def same_value(first, second):
 def changed_settings(edited, base):
     """Return the settings of *edited* that differ from *base*, in preset file form."""
     return {
-        key: decode_value(value)
+        key: decode_value(key, value)
         for key in edited.config_keys()
         if key not in UNSENT_KEYS and (value := edited.config_value(key)) != base.config_value(key)
     }
@@ -668,7 +697,7 @@ def send(api):
         # A saved copy stays as it was when a pull moves the bundle on, so the bundle says nothing
         # about what the user could see when making this edit.
         hidden = [key for key in sendable
-                  if key in theirs and not same_value(theirs[key], decode_value(selected.config_value(key) or ""))]
+                  if key in theirs and not same_value(theirs[key], decode_value(key, selected.config_value(key) or ""))]
         if hidden:
             raise SyncError(f"Nothing was sent, because Filament DB holds other values for: {key_list(hidden)}. "
                             "Make the change on the synced preset instead.")

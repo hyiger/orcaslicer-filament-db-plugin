@@ -531,7 +531,7 @@ class TestSend:
         app.db.filaments[PLAIN_ID]["temperatures"]["nozzle"] = 230
         app.pull()
         app.filaments.select("Edited Plain PLA", {"nozzle_temperature": "220"})
-        assert app.send().message == ("Nothing was sent, because Filament DB holds other values for: "
+        assert app.send().message == ("Nothing was sent, because the synced preset shows other values for: "
                                       "nozzle_temperature. Make the change on the synced preset instead.")
         assert not app.db.posts
 
@@ -544,6 +544,43 @@ class TestSend:
         app.send()
         assert app.db.posts == [{"density": "1.35"}]
         assert app.db.filaments[PLAIN_ID]["temperatures"]["nozzle"] == 230
+
+    def test_a_copy_cannot_bring_back_a_setting_removed_in_filament_db(self, app, plugin):
+        """With the setting gone from both Filament DB and the bundle, the two agree and show no conflict."""
+        app.db.filaments[PLAIN_ID]["settings"] = {"fan_max_speed": ["65"]}
+        app.pull()
+        self.saved_copy(app, plugin)
+        del app.db.filaments[PLAIN_ID]["settings"]["fan_max_speed"]
+        app.pull()
+        app.filaments.select("Edited Plain PLA", {"fan_max_speed": "70"})
+        assert app.send().message == ("Nothing was sent, because the synced preset shows other values for: "
+                                      "fan_max_speed. Make the change on the synced preset instead.")
+        assert not app.db.posts
+
+    def test_a_copy_saved_with_its_own_value_for_a_setting_filament_db_leaves_out_sends_nothing(self, app, plugin):
+        """The copy's saved value may be an override Filament DB has since removed, so it is not trusted."""
+        app.pull()
+        self.saved_copy(app, plugin, fan_max_speed="50")
+        app.filaments.select("Edited Plain PLA", {"fan_max_speed": "70"})
+        assert app.send().message == ("Nothing was sent, because the synced preset shows other values for: "
+                                      "fan_max_speed. Make the change on the synced preset instead.")
+        assert not app.db.posts
+
+    def test_a_copy_cannot_be_checked_when_orcaslicer_has_not_loaded_the_synced_preset(self, app, plugin):
+        app.pull()
+        self.saved_copy(app, plugin)
+        del app.filaments.presets[PLAIN]
+        app.filaments.select("Edited Plain PLA", {"fan_max_speed": "70"})
+        assert app.send().message == ("Nothing was sent, because OrcaSlicer has not loaded this filament's synced "
+                                      "preset. Run Pull from Filament DB, then send again.")
+        assert not app.db.posts
+
+    def test_a_copy_showing_orcaslicers_own_value_can_set_one_in_filament_db(self, app, plugin):
+        app.pull()
+        self.saved_copy(app, plugin)
+        app.filaments.select("Edited Plain PLA", {"fan_max_speed": "70"})
+        assert app.send().message == "Sent 1 of 1 edits to Filament DB."
+        assert app.db.posts == [{"fan_max_speed": ["70"]}]
 
     def test_a_copys_conflict_is_checked_against_the_bundle(self, app, plugin):
         app.pull()

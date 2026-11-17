@@ -347,8 +347,8 @@ class TestPull:
     def test_adding_a_filament_does_not_move_an_existing_preset(self, app, plugin):
         first = {"name": "A:B", "filament_id": "fdb_1"}
         added = {"name": "A/B", "filament_id": "fdb_2"}  # sorts first by name, but it came later
-        assert plugin.preset_files([first], app.bundle_dir) == {"A-B": first}
-        assert plugin.preset_files([added, first], app.bundle_dir) == {"A-B": first, "A-B (2)": added}
+        assert plugin.preset_files([first], app.bundle_dir, {}, set()) == {"A-B": first}
+        assert plugin.preset_files([added, first], app.bundle_dir, {}, set()) == {"A-B": first, "A-B (2)": added}
 
     def test_a_refused_reload_puts_the_old_files_back(self, app):
         """The files are the conflict check's ancestor, so they must match what OrcaSlicer loaded."""
@@ -489,6 +489,19 @@ class TestLongNames:
         [stem] = [stem for stem in preset_stems(app) if stem != "Calibrated PLA"]
         assert name.startswith(stem.rpartition("… ")[0]) and len(stem.encode("utf-16-le")) // 2 > 80
 
+    def test_on_windows_a_file_name_that_no_longer_fits_the_folder_is_cut_again(self, app, monkeypatch):
+        filament_dir = app.bundle_dir / "filament"
+        monkeypatch.setattr(app.plugin, "MAX_PATH_UNITS", len(str(filament_dir)) + 1 + 300)  # room for 255
+        app.db.filaments[PLAIN_ID]["name"] = "P" * 300
+        app.pull()
+        [before] = [stem for stem in preset_stems(app) if stem != "Calibrated PLA"]
+        monkeypatch.setattr(app.plugin, "MAX_PATH_UNITS", len(str(filament_dir)) + 1 + 100)
+        assert app.pull().status is PluginResult.Success
+        [after] = [stem for stem in preset_stems(app) if stem != "Calibrated PLA"]
+        assert after != before
+        for path in filament_dir.glob("*.json"):
+            assert len(str(path).encode("utf-16-le")) // 2 + len(".tmp") <= app.plugin.MAX_PATH_UNITS
+
     def test_a_long_name_can_be_edited_and_sent(self, app):
         app.db.filaments[PLAIN_ID]["name"] = "P" * 300
         app.pull()
@@ -496,6 +509,145 @@ class TestLongNames:
         edit(app, f"_local/{BUNDLE_ID}/{stem}", filament_vendor="Maker")
         assert app.send().message == "Sent 1 of 1 edits to Filament DB."
         assert app.db.posts == [{"vendor": "Maker"}]
+
+
+NEW_ID = "c" * 24
+FIRST_ID = "0" * 24  # sorts before every other id
+
+
+def bundle_ids(app):
+    return {stem: bundle_preset(app, stem)["filament_id"].removeprefix("fdb_") for stem in preset_stems(app)}
+
+
+def put_in_slot(app, slot, stem):
+    """Put the synced preset *stem* in the selected filament slot, or in one of the others."""
+    name = f"_local/{BUNDLE_ID}/{stem}"
+    if slot == "selected":
+        app.filaments.select(name)
+    else:
+        app.state.slots.append(name)
+
+
+def add_filament(app, filament_id, name):
+    app.db.filaments[filament_id] = {"name": name, "type": "PLA", "vendor": "Spike", "temperatures": {"nozzle": 250}}
+
+
+class TestAFileNameStaysWithItsFilament:
+    """OrcaSlicer restores the preset of every filament slot by name, and a preset's name is its file name.
+    A file name handed to another filament would quietly put that filament in the slot."""
+
+    @pytest.fixture(params=["selected", "secondary"])
+    def slot(self, request):
+        return request.param
+
+    @pytest.fixture
+    def alike(self, app):
+        app.db.filaments[PLAIN_ID]["name"] = "A/B"
+        app.db.filaments[CALIBRATED_ID]["name"] = "A:B"
+        app.pull()
+        assert bundle_ids(app) == {"A-B": PLAIN_ID, "A-B (2)": CALIBRATED_ID}
+
+    def test_deleting_the_first_of_two_names_alike_does_not_move_the_second(self, app, alike, slot):
+        put_in_slot(app, slot, "A-B")
+        del app.db.filaments[PLAIN_ID]
+        assert "chose other presets for them: A-B." in app.pull().message
+        assert bundle_ids(app) == {"A-B (2)": CALIBRATED_ID}
+        assert f"_local/{BUNDLE_ID}/A-B" not in app.filaments.presets
+
+    def test_a_new_filament_does_not_take_a_file_name_a_slot_holds(self, app, alike, slot):
+        put_in_slot(app, slot, "A-B")
+        del app.db.filaments[PLAIN_ID]
+        add_filament(app, NEW_ID, "A/B")
+        assert "chose other presets for them: A-B." in app.pull().message
+        assert bundle_ids(app) == {"A-B (2)": CALIBRATED_ID, "A-B (3)": NEW_ID}
+
+    def test_a_new_filament_keeps_the_file_name_it_got_once_the_slot_moves_on(self, app, alike, slot):
+        put_in_slot(app, slot, "A-B")
+        del app.db.filaments[PLAIN_ID]
+        add_filament(app, NEW_ID, "A/B")
+        app.pull()
+        app.state.slots.clear()
+        app.filaments.select(f"_local/{BUNDLE_ID}/A-B (2)")
+        app.pull()
+        assert bundle_ids(app) == {"A-B (2)": CALIBRATED_ID, "A-B (3)": NEW_ID}
+
+    def test_a_file_name_no_slot_holds_can_go_to_a_new_filament(self, app, alike):
+        del app.db.filaments[PLAIN_ID]
+        add_filament(app, NEW_ID, "A/B")
+        assert "chose other presets" not in app.pull().message
+        assert bundle_ids(app) == {"A-B": NEW_ID, "A-B (2)": CALIBRATED_ID}
+
+    def test_a_new_filament_that_sorts_first_does_not_take_an_existing_file_name(self, app, slot):
+        app.db.filaments[PLAIN_ID]["name"] = "A:B"
+        app.pull()
+        put_in_slot(app, slot, "A-B")
+        add_filament(app, FIRST_ID, "A/B")
+        assert app.pull().message == "Pulled 3 filaments from Filament DB for a 0.4 mm nozzle."
+        assert bundle_ids(app) == {"A-B": PLAIN_ID, "A-B (2)": FIRST_ID, "Calibrated PLA": CALIBRATED_ID}
+
+    def test_a_new_filament_does_not_take_the_file_name_of_a_renamed_one_in_a_slot(self, app, slot):
+        app.pull()
+        put_in_slot(app, slot, "Plain PLA")
+        app.db.filaments[PLAIN_ID]["name"] = "Old PLA"
+        add_filament(app, NEW_ID, "Plain PLA")
+        assert "chose other presets for them: Plain PLA." in app.pull().message
+        assert bundle_ids(app) == {"Calibrated PLA": CALIBRATED_ID, "Old PLA": PLAIN_ID, "Plain PLA (2)": NEW_ID}
+
+    def test_a_filament_in_a_slot_can_take_its_own_name_in_other_capitals(self, app, slot):
+        app.pull()
+        put_in_slot(app, slot, "Plain PLA")
+        app.db.filaments[PLAIN_ID]["name"] = "PLAIN PLA"
+        app.pull()
+        assert bundle_ids(app) == {"Calibrated PLA": CALIBRATED_ID, "PLAIN PLA": PLAIN_ID}
+
+    def test_a_renamed_filament_leaves_its_number_behind(self, app, alike):
+        app.db.filaments[CALIBRATED_ID]["name"] = "C:D"
+        app.pull()
+        assert bundle_ids(app) == {"A-B": PLAIN_ID, "C-D": CALIBRATED_ID}
+
+    def test_a_filament_whose_own_name_loses_its_number_loses_it_from_the_file_name(self, app):
+        app.db.filaments[PLAIN_ID]["name"] = "PLA (2)"
+        app.pull()
+        app.db.filaments[PLAIN_ID]["name"] = "PLA"
+        app.pull()
+        assert bundle_ids(app) == {"Calibrated PLA": CALIBRATED_ID, "PLA": PLAIN_ID}
+
+    def test_a_filament_whose_own_name_has_a_number_keeps_it(self, app):
+        app.db.filaments[PLAIN_ID]["name"] = "PLA (2)"
+        app.pull()
+        app.pull()
+        assert bundle_ids(app) == {"Calibrated PLA": CALIBRATED_ID, "PLA (2)": PLAIN_ID}
+
+    # A half-saved hand edit, a file that is not a preset, and a preset that lost its name.
+    @pytest.mark.parametrize("content", ["{", "[]", f'{{"filament_id": "fdb_{PLAIN_ID}"}}'])
+    def test_a_pull_repairs_a_file_it_cannot_read(self, app, content):
+        app.pull()
+        (app.bundle_dir / "filament" / "Plain PLA.json").write_text(content, encoding="utf-8")
+        assert app.pull().message == "Pulled 2 filaments from Filament DB for a 0.4 mm nozzle."
+        assert bundle_ids(app) == {"Calibrated PLA": CALIBRATED_ID, "Plain PLA": PLAIN_ID}
+
+    def test_a_pull_still_leaves_files_it_cannot_read_alone_when_filament_db_is_empty(self, app):
+        app.pull()
+        (app.bundle_dir / "filament" / "Plain PLA.json").write_text("{", encoding="utf-8")
+        (app.bundle_dir / "filament" / "Calibrated PLA.json").unlink()
+        app.db.filaments.clear()
+        assert "Filament DB has no filaments" in app.pull().message
+        assert preset_stems(app) == ["Plain PLA"]
+
+    def test_a_numbered_long_name_keeps_its_file_name(self, app):
+        app.db.filaments[PLAIN_ID]["name"] = app.db.filaments[CALIBRATED_ID]["name"] = "P" * 300
+        app.pull()
+        numbered = next(stem for stem, filament_id in bundle_ids(app).items() if filament_id == CALIBRATED_ID)
+        assert numbered.endswith(" (2)")
+        del app.db.filaments[PLAIN_ID]
+        app.pull()
+        assert bundle_ids(app) == {numbered: CALIBRATED_ID}
+
+    def test_an_edit_to_a_filament_that_kept_its_number_is_sent_to_it(self, app, alike):
+        del app.db.filaments[PLAIN_ID]
+        edit(app, f"_local/{BUNDLE_ID}/A-B (2)", filament_vendor="Maker")
+        assert app.send().message == "Sent 1 of 1 edits to Filament DB."
+        assert app.db.filaments[CALIBRATED_ID]["vendor"] == "Maker"
 
 
 class TestSend:

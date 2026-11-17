@@ -430,9 +430,10 @@ def app(orca, plugin, db):
     """A running OrcaSlicer with the plugin loaded, its nozzle at 0.4 and an active user with a folder."""
     filaments = FakeFilaments()
     bundles = FakeBundles(plugin.data_dir_for_test, filaments, "cloud-user")
-    state = SimpleNamespace(nozzle="0.4")
+    # slots names the presets of the other filament slots, which OrcaSlicer restores by name on a reload.
+    state = SimpleNamespace(nozzle="0.4", slots=[])
     bundle = SimpleNamespace(filaments=filaments, full_config_value=lambda key: state.nozzle,
-                             current_filament_preset_names=lambda: [filaments.selected.name])
+                             current_filament_preset_names=lambda: [filaments.selected.name, *state.slots])
     orca.host.preset_bundle = lambda: bundle
     orca.host.preset.bundles = bundles
     pull_command = plugin.PullFromFilamentDb()

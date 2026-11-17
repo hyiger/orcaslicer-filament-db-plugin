@@ -156,6 +156,8 @@ TEMPORARY_SUFFIX = ".json.tmp"
 # On Windows a whole path is held to 259 UTF-16 units unless the program's manifest asks for long paths.
 # OrcaSlicer's does not, and the plugin runs inside it, so the folder takes room from the file name.
 MAX_PATH_UNITS = 259 if os.name == "nt" else None
+# The number preset_stem() puts after a file name that another filament has already.
+NUMBERED_STEM = re.compile(r".* \(([0-9]+)\)", re.DOTALL)
 # OrcaSlicer starts a new thread for every click of a Run button.
 RUN_LOCK = threading.Lock()
 # OrcaSlicer asks in the background and denies the attempt that made it ask.
@@ -340,17 +342,35 @@ def fitted(stem, name, suffix, room):
     return cut.rstrip(" .") + mark + suffix
 
 
-def preset_stem(name, taken, room):
-    """Return a file name for the preset called *name* that does not collide with those in *taken*."""
+def safe_stem(name):
+    """Return *name* as a file name that every platform can use, before any cut or number."""
     stem = UNSAFE_NAME_CHARACTERS.sub("-", name).strip(" .") or "Filament"
     if device := WINDOWS_DEVICE_NAME.match(stem):
         stem = stem[:device.end()] + "_" + stem[device.end():]
+    return stem
+
+
+def preset_stem(name, taken, room):
+    """Return a file name for the preset called *name* that does not collide with those in *taken*."""
+    stem = safe_stem(name)
     candidate, number = fitted(stem, name, "", room), 1
     while candidate.casefold() in taken:
         number += 1
         candidate = fitted(stem, name, f" ({number})", room)
-    taken.add(candidate.casefold())
     return candidate
+
+
+def is_stem_of(stem, name, room, old_name):
+    """Return whether preset_stem() can give *name* the file name *stem*, with or without a number.
+
+    The file was named for *old_name*. A number that name had of its own, as in "PLA (2)", looks just like
+    one preset_stem() added, so only the same name, as a file name, keeps the number.
+    """
+    if not isinstance(old_name, str) or safe_stem(old_name) != safe_stem(name):
+        return False
+    numbered = NUMBERED_STEM.fullmatch(stem)
+    suffixes = ["", f" ({numbered[1]})"] if numbered else [""]
+    return any(fitted(safe_stem(name), name, suffix, room) == stem for suffix in suffixes)
 
 
 def write_file(path, data):
@@ -368,11 +388,32 @@ def write_json(path, content):
     write_file(path, json.dumps(content, indent=2, ensure_ascii=False).encode("utf-8"))
 
 
-def preset_files(profiles, filament_dir):
-    """Return {stem: profile}. Going by id keeps a stem with its filament when others come and go."""
-    taken, room = set(), file_name_room(filament_dir)
-    return {preset_stem(profile["name"], taken, room): profile
-            for profile in sorted(profiles, key=lambda profile: profile["filament_id"])}
+def preset_files(profiles, filament_dir, previous, in_use):
+    """Return {stem: profile}, given the bundle's *previous* {stem: profile} and the stems *in_use* by a slot.
+
+    OrcaSlicer restores the preset of every filament slot by name, and a preset's name is its file name, so
+    a file name that went to another filament would quietly put that filament in the slot. A filament
+    keeps its file name for as long as its name gives it, number included, so that another one coming or
+    going does not move it. A new name goes by id, and never takes a file name that a slot holds for
+    another filament: that slot then gets another preset, and the pull says so.
+    """
+    room = file_name_room(filament_dir)
+    old_stems = {profile.get("filament_id"): (stem, profile.get("name")) for stem, profile in previous.items()}
+    held = {stem.casefold(): profile.get("filament_id") for stem, profile in previous.items() if stem in in_use}
+    presets, unplaced = {}, []
+    for profile in sorted(profiles, key=lambda profile: profile["filament_id"]):
+        stem, old_name = old_stems.get(profile["filament_id"], (None, None))
+        if stem is not None and is_stem_of(stem, profile["name"], room, old_name):
+            presets[stem] = profile
+        else:
+            unplaced.append(profile)
+    taken = {stem.casefold() for stem in presets}
+    for profile in unplaced:
+        others = {stem for stem, filament_id in held.items() if filament_id != profile["filament_id"]}
+        stem = preset_stem(profile["name"], taken | others, room)
+        taken.add(stem.casefold())
+        presets[stem] = profile
+    return presets
 
 
 def write_bundle(bundle_dir, presets):
@@ -423,6 +464,23 @@ def read_bundle(bundle_dir):
     """Return {stem: profile} for the presets of the bundle."""
     return {path.stem: json.loads(path.read_text(encoding="utf-8"))
             for path in (bundle_dir / "filament").glob("*.json")}
+
+
+def read_pulled(bundle_dir):
+    """Return {stem: profile} for the presets of the bundle that can be read.
+
+    A pull replaces or removes every file, so one it cannot read, such as a half-saved hand edit, is
+    left for it to fix rather than stopping it.
+    """
+    pulled = {}
+    for path in (bundle_dir / "filament").glob("*.json"):
+        try:
+            profile = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(profile, dict):
+            pulled[path.stem] = profile
+    return pulled
 
 
 def active_nozzle(bundle):
@@ -676,11 +734,11 @@ def pull(api):
         raise SyncError("Filament DB has no filaments, so the synced presets were left alone. "
                         "Check that the plugin is pointing at the right copy.")
 
-    presets = preset_files(profiles, bundle_dir / "filament")
+    in_use = {name.removeprefix(BUNDLE_PRESET_PREFIX) for name in bundle.current_filament_preset_names()
+              if name.startswith(BUNDLE_PRESET_PREFIX)}
+    presets = preset_files(profiles, bundle_dir / "filament", read_pulled(bundle_dir), in_use)
     refuse_moved_edits(filaments.edited_preset(), presets)
-    replaced = sorted(name.removeprefix(BUNDLE_PRESET_PREFIX) for name in set(bundle.current_filament_preset_names())
-                      if name.startswith(BUNDLE_PRESET_PREFIX)
-                      and name.removeprefix(BUNDLE_PRESET_PREFIX) not in presets)
+    replaced = sorted(in_use - presets.keys())
     install_bundle(bundle_dir, presets)
 
     message = f"Pulled {len(profiles)} filaments from Filament DB for a {nozzle} mm nozzle."

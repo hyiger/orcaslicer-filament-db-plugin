@@ -41,6 +41,8 @@ FILAMENT_KEYS = [
 # Known to the config definitions, but not filament settings, so a preset holding one is invalid.
 INVALID_IN_A_PRESET = {"filament_colour", "temperature"}
 NULLABLE_KEYS = {"filament_retraction_length", "filament_retraction_speed", "filament_deretraction_speed", "filament_z_hop"}
+# A path under this answers with a redirect, the way a server that moved or sits behind a proxy does.
+MOVED_PREFIX = "/old"
 
 
 class PluginResult(enum.Enum):
@@ -171,9 +173,12 @@ class FakeFilamentDb:
         self.fail_with = None
         self.record_reads = 0
         self.posts = []
+        # The Authorization header of every request that got past the redirect, None when it had none.
+        self.authorizations = []
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self.handler())
         threading.Thread(target=self.server.serve_forever, args=(0.01,), daemon=True).start()
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        self.moved_to = self.url
 
     def export(self, filament_id):
         record = self.filaments[filament_id]
@@ -217,7 +222,19 @@ class FakeFilamentDb:
                 self.end_headers()
                 self.wfile.write(data)
 
+            def moved(self):
+                if not self.path.startswith(MOVED_PREFIX + "/"):
+                    return False
+                self.send_response(302)
+                self.send_header("Location", db.moved_to + self.path[len(MOVED_PREFIX):])
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return True
+
             def refused(self):
+                if self.moved():
+                    return True
+                db.authorizations.append(self.headers.get("Authorization"))
                 if db.fail_with:
                     self.reply(*db.fail_with)
                     return True
@@ -334,6 +351,15 @@ def db():
     }
     server.calibrations[(CALIBRATED_ID, "0.4")] = [{"keys": {"filament_flow_ratio": ["0.97"], "pressure_advance": ["0.04"]}}]
     server.calibrations[(CALIBRATED_ID, "0.6")] = [{"keys": {"filament_flow_ratio": ["0.93"], "pressure_advance": ["0.02"]}}]
+    yield server
+    server.server.shutdown()
+
+
+@pytest.fixture
+def foreign(db):
+    """A second Filament DB on another port: an origin the API key was not given for."""
+    server = FakeFilamentDb()
+    server.filaments = db.filaments
     yield server
     server.server.shutdown()
 

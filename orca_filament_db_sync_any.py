@@ -47,6 +47,8 @@ SEND_NAME = "Send to Filament DB"
 
 DEFAULT_URL = "http://localhost:3456"
 REQUEST_TIMEOUT_SECONDS = 30
+# A URL that leaves the port out means these, so http://host and http://host:80 are one origin.
+DEFAULT_PORTS = {"http": 80, "https": 443}
 
 BUNDLE_ID = "filament-db"
 PROBE_ID = "filament-db-probe"
@@ -138,6 +140,7 @@ class Api:
         self.other_printers = set()
         if not self.url.startswith(("http://", "https://")):
             raise SyncError(f"The Filament DB URL must start with http:// or https://, not {url!r}.")
+        self.opener = urllib.request.build_opener(SameOriginRedirects(self.url))
 
     def request(self, path, body=None, missing_ok=False):
         """Return the decoded response, or None for a 404 when missing_ok is set."""
@@ -151,7 +154,7 @@ class Api:
         request = urllib.request.Request(self.url + path, data=data, headers=headers,
                                          method="GET" if body is None else "POST")
         try:
-            with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+            with self.opener.open(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
                 return json.load(response)
         except PermissionError as error:
             raise SyncError(PERMISSION_TEXT) from error
@@ -170,6 +173,54 @@ class Api:
             raise SyncError(f"Filament DB at {self.url} closed the connection before it answered.") from error
         except ValueError as error:
             raise SyncError(f"Filament DB at {self.url} sent a response that is not JSON.") from error
+
+
+class SameOriginRedirects(urllib.request.HTTPRedirectHandler):
+    """Stops a request that carries the API key from following a redirect to another origin.
+
+    urllib copies every header but the content ones onto the redirected request, so left to itself it
+    would hand the key to whatever host the server, or anything between, points it at. Following such
+    a redirect without the key would not help: the new host would refuse it and the user would be told
+    to check a key that is fine, after OrcaSlicer asked them to allow a host they never entered.
+    Stopping at the first hop off the origin also means a later hop back is never reached.
+    """
+
+    def __init__(self, url):
+        super().__init__()
+        self.url = url
+        self.origin = origin(url)
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target = origin(newurl)
+        # None is a target urllib would not dial as written, so it never matches, even a configured None.
+        if req.has_header("Authorization") and (target is None or target != self.origin):
+            fp.close()
+            raise SyncError(f"Filament DB at {self.url} redirected to {site(newurl)}, which was not followed so "
+                            "that the API key stays with the configured address. If Filament DB has moved, "
+                            "put its new address in the plugin's config.")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def origin(url):
+    """Return the scheme, host and port that the API key is scoped to, or None when they cannot be trusted.
+
+    That is a port that is not a number, or credentials before the host: urlsplit skips those, but urllib
+    dials them as part of the host name, so http://x@db:3456 would go to a host called "x@db".
+    """
+    parts = urllib.parse.urlsplit(url)
+    if "@" in parts.netloc:
+        return None
+    try:
+        port = parts.port or DEFAULT_PORTS.get(parts.scheme)
+    except ValueError:
+        return None
+    return parts.scheme, parts.hostname, port
+
+
+def site(url):
+    """Return *url* without its path, which can hold a token, or any credentials before the host."""
+    parts = urllib.parse.urlsplit(url)
+    return f"{parts.scheme}://{parts.netloc.rpartition('@')[2]}"
 
 
 def http_error_text(error):

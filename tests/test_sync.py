@@ -1122,13 +1122,168 @@ class TestPlateRows:
         assert app.send().message == "Sent 1 of 1 edits to Filament DB."
 
     def test_the_record_is_only_read_for_a_plate_temperature(self, app):
-        edit(app, PLAIN, nozzle_temperature="222", supertack_plate_temp="55")
+        # Calibrated PLA has no bed temperature, so making its preset does not need the record either.
+        edit(app, CALIBRATED, nozzle_temperature="222", supertack_plate_temp="55")
+        app.db.record_reads = 0
         app.send()
         assert app.db.record_reads == 0
-        edit(app, PLAIN, textured_cool_plate_temp_initial_layer="65")
+        edit(app, CALIBRATED, textured_cool_plate_temp_initial_layer="65")
+        app.db.record_reads = 0
         assert app.send().message == "Sent 1 of 1 edits to Filament DB."
         # Once to ask, and once more after the confirmation in case a row was added meanwhile.
         assert app.db.record_reads == 2
+
+
+class TestBedSpecificValues:
+    """A preset has a temperature per plate, so a value Filament DB holds for one bed type stays on its plate."""
+
+    OTHER_PLATES = ("cool", "eng", "supertack", "textured_cool", "textured")
+    HOT_PLATE_CALIBRATION = {"bedType": "Hot Plate", "keys": {"hot_plate_temp": ["88"], "nozzle_temperature": ["250"]}}
+    LEFT_OUT_TEXT = "Calibration tied to one bed type was left out, other than any bed temperature for its plate: "
+    NO_PLATE_TEXT = "Calibration for a bed type OrcaSlicer has no plate for was left out: "
+
+    def test_a_hot_plate_row_stays_on_the_hot_plate(self, app):
+        """The issue as reported: a Hot Plate row of 75 reached the Textured PEI Plate."""
+        app.db.filaments[PLAIN_ID]["bedTypeTemps"] = [{"bedType": "Hot Plate", "temperature": 75}]
+        app.pull()
+        preset = bundle_preset(app, "Plain PLA")
+        assert (preset["hot_plate_temp"], preset["hot_plate_temp_initial_layer"]) == (["75"], ["75"])
+        for plate in self.OTHER_PLATES:
+            assert preset[f"{plate}_plate_temp"] == ["60"]
+            assert preset[f"{plate}_plate_temp_initial_layer"] == ["60"]
+
+    def test_a_hot_plate_row_for_the_first_layer_stays_on_the_hot_plate(self, app):
+        app.db.filaments[PLAIN_ID]["temperatures"]["bedFirstLayer"] = 62
+        app.db.filaments[PLAIN_ID]["bedTypeTemps"] = [{"bedType": "Hot Plate", "firstLayerTemperature": 70}]
+        app.pull()
+        preset = bundle_preset(app, "Plain PLA")
+        assert preset["hot_plate_temp_initial_layer"] == ["70"]
+        assert preset["textured_plate_temp_initial_layer"] == ["62"]
+
+    @pytest.mark.parametrize("stored", [["58"], "58", '"58"'])
+    def test_a_bed_temperature_in_the_settings_bag_reaches_the_other_plates(self, app, stored):
+        del app.db.filaments[PLAIN_ID]["temperatures"]["bed"]
+        app.db.filaments[PLAIN_ID]["settings"] = {"hot_plate_temp": stored}
+        app.db.filaments[PLAIN_ID]["bedTypeTemps"] = [{"bedType": "Hot Plate", "temperature": 75}]
+        app.pull()
+        assert bundle_preset(app, "Plain PLA")["textured_plate_temp"] == ["58"]
+
+    def test_a_hot_plate_row_without_a_bed_temperature_leaves_the_other_plates_alone(self, app):
+        del app.db.filaments[PLAIN_ID]["temperatures"]["bed"]
+        app.db.filaments[PLAIN_ID]["bedTypeTemps"] = [{"bedType": "Hot Plate", "temperature": 75}]
+        app.pull()
+        preset = bundle_preset(app, "Plain PLA")
+        assert preset["hot_plate_temp"] == ["75"]
+        assert "textured_plate_temp" not in preset
+
+    def test_another_plates_row_still_leaves_the_hot_plate_temperature_to_the_rest(self, app):
+        app.db.filaments[PLAIN_ID]["bedTypeTemps"] = [{"bedType": "Textured PEI Plate", "temperature": 70}]
+        app.pull()
+        preset = bundle_preset(app, "Plain PLA")
+        assert preset["textured_plate_temp"] == ["70"]
+        assert preset["cool_plate_temp"] == ["60"]
+
+    def test_a_calibration_for_every_bed_type_reaches_the_plates_beside_a_hot_plate_row(self, app):
+        app.db.filaments[PLAIN_ID]["bedTypeTemps"] = [{"bedType": "Hot Plate", "temperature": 75}]
+        app.db.calibrations[(PLAIN_ID, "0.4")] = [{"keys": {"hot_plate_temp": ["80"]}}]
+        app.pull()
+        preset = bundle_preset(app, "Plain PLA")
+        assert (preset["hot_plate_temp"], preset["textured_plate_temp"]) == (["80"], ["80"])
+
+    def test_the_record_is_not_read_when_every_plate_has_its_own_temperature(self, app):
+        app.db.filaments[PLAIN_ID]["settings"] = {
+            f"{plate}_plate_temp{suffix}": ["55"] for plate in self.OTHER_PLATES for suffix in ("", "_initial_layer")}
+        app.pull()
+        assert app.db.record_reads == 0
+
+    def test_the_record_is_read_once_for_both_quotes_and_plates(self, app):
+        app.db.filaments[PLAIN_ID]["vendor"] = '"Maker"'
+        app.pull()
+        assert app.db.record_reads == 1
+
+    def test_a_hot_plate_calibration_stays_on_the_hot_plate(self, app):
+        """The issue as reported: its 88 reached the Textured PEI Plate, and its 250 every plate."""
+        app.db.calibrations[(PLAIN_ID, "0.4")] = [self.HOT_PLATE_CALIBRATION]
+        message = app.pull().message
+        preset = bundle_preset(app, "Plain PLA")
+        assert preset["hot_plate_temp"] == ["88"]
+        assert preset["textured_plate_temp"] == ["60"]
+        assert preset["nozzle_temperature"] == ["215"]
+        assert message.endswith(self.LEFT_OUT_TEXT + "Hot Plate.")
+
+    def test_a_calibration_for_another_plate_moves_to_that_plate(self, app):
+        app.db.calibrations[(PLAIN_ID, "0.4")] = [{"bedType": "Textured PEI Plate", "keys": {
+            "hot_plate_temp": ["88"], "hot_plate_temp_initial_layer": ["90"], "pressure_advance": ["0.05"]}}]
+        app.pull()
+        preset = bundle_preset(app, "Plain PLA")
+        assert (preset["textured_plate_temp"], preset["textured_plate_temp_initial_layer"]) == (["88"], ["90"])
+        assert (preset["hot_plate_temp"], preset["cool_plate_temp_initial_layer"]) == (["60"], ["60"])
+        assert "pressure_advance" not in preset
+
+    def test_a_calibration_wins_over_its_plates_row(self, app):
+        app.db.filaments[PLAIN_ID]["bedTypeTemps"] = [{"bedType": "Textured PEI Plate", "temperature": 70}]
+        app.db.calibrations[(PLAIN_ID, "0.4")] = [{"bedType": "Textured PEI Plate", "keys": {"hot_plate_temp": ["88"]}}]
+        assert app.pull().message == "Pulled 2 filaments from Filament DB for a 0.4 mm nozzle."
+        assert bundle_preset(app, "Plain PLA")["textured_plate_temp"] == ["88"]
+
+    def test_a_calibration_for_a_bed_type_orcaslicer_has_no_plate_for_is_left_out(self, app):
+        app.db.calibrations[(PLAIN_ID, "0.4")] = [{"bedType": "Smooth PEI", "keys": {
+            "hot_plate_temp": ["88"], "pressure_advance": ["0.05"]}}]
+        message = app.pull().message
+        assert message.endswith(" 0.4 mm nozzle. " + self.NO_PLATE_TEXT + "Smooth PEI.")
+        preset = bundle_preset(app, "Plain PLA")
+        assert preset["hot_plate_temp"] == ["60"]
+        assert "pressure_advance" not in preset
+
+    def test_a_calibration_with_only_bed_temperatures_is_not_reported(self, app):
+        app.db.calibrations[(PLAIN_ID, "0.4")] = [{"bedType": "Hot Plate", "keys": {"hot_plate_temp": ["88"]}}]
+        assert app.pull().message == "Pulled 2 filaments from Filament DB for a 0.4 mm nozzle."
+
+    def test_a_calibrated_plate_without_a_first_layer_value_uses_its_bed_temperature(self, app):
+        """The Hot Plate's first layer followed its calibrated 88, and the Textured PEI Plate's stayed at 60."""
+        for bed_type, plate in (("Hot Plate", "hot"), ("Textured PEI Plate", "textured")):
+            app.db.calibrations[(PLAIN_ID, "0.4")] = [{"bedType": bed_type, "keys": {"hot_plate_temp": ["88"]}}]
+            app.pull()
+            preset = bundle_preset(app, "Plain PLA")
+            assert (preset[f"{plate}_plate_temp"], preset[f"{plate}_plate_temp_initial_layer"]) == (["88"], ["88"])
+
+    def test_a_calibrated_plate_keeps_the_filaments_own_first_layer_temperature(self, app):
+        app.db.filaments[PLAIN_ID]["temperatures"]["bedFirstLayer"] = 62
+        for bed_type, plate in (("Hot Plate", "hot"), ("Textured PEI Plate", "textured")):
+            app.db.calibrations[(PLAIN_ID, "0.4")] = [{"bedType": bed_type, "keys": {"hot_plate_temp": ["88"]}}]
+            app.pull()
+            assert bundle_preset(app, "Plain PLA")[f"{plate}_plate_temp_initial_layer"] == ["62"]
+
+    def test_each_plate_gets_its_own_calibration(self, app):
+        app.db.calibrations[(PLAIN_ID, "0.4")] = [
+            {"bedType": "Smooth PEI", "keys": {"hot_plate_temp": ["99"]}},
+            {"bedType": "Hot Plate", "keys": {"hot_plate_temp": ["88"]}},
+            {"bedType": "Textured PEI Plate", "keys": {"hot_plate_temp": ["70"], "nozzle_temperature": ["250"]}}]
+        message = app.pull().message
+        preset = bundle_preset(app, "Plain PLA")
+        assert (preset["hot_plate_temp"], preset["textured_plate_temp"], preset["cool_plate_temp"]) == (
+            ["88"], ["70"], ["60"])
+        assert message.endswith(f"{self.LEFT_OUT_TEXT}Textured PEI Plate. {self.NO_PLATE_TEXT}Smooth PEI.")
+
+    def test_a_plates_calibration_for_another_printer_is_left_out(self, app):
+        app.db.calibrations[(PLAIN_ID, "0.4")] = [
+            {"bedType": "Hot Plate", "keys": {"hot_plate_temp": ["88"]}},
+            {"bedType": "Textured PEI Plate", "printer": "MK4", "keys": {"hot_plate_temp": ["70"]}}]
+        message = app.pull().message
+        assert bundle_preset(app, "Plain PLA")["textured_plate_temp"] == ["60"]
+        assert message.endswith("Calibration tied to other printers was left out: MK4.")
+
+    def test_a_calibration_for_every_bed_type_comes_first(self, app):
+        app.db.calibrations[(PLAIN_ID, "0.4")] = [self.HOT_PLATE_CALIBRATION, {"keys": {"nozzle_temperature": ["230"]}}]
+        assert app.pull().message == "Pulled 2 filaments from Filament DB for a 0.4 mm nozzle."
+        assert bundle_preset(app, "Plain PLA")["nozzle_temperature"] == ["230"]
+
+    def test_send_holds_back_only_what_a_bed_type_calibration_sets(self, app):
+        app.db.calibrations[(PLAIN_ID, "0.4")] = [self.HOT_PLATE_CALIBRATION]
+        edit(app, PLAIN, nozzle_temperature="222", hot_plate_temp="90")
+        assert app.send().message == ("Sent 1 of 2 edits to Filament DB. Change these in Filament DB, as they "
+                                      "cannot be sent: hot_plate_temp.")
+        assert app.db.posts == [{"temperatures": {"nozzle": "222"}}]
 
 
 class TestConflicts:
@@ -1606,6 +1761,8 @@ class TestQuotes:
         assert bundle_preset(app, "Plain PLA")["filament_flow_ratio"] == ["1.05"]
 
     def test_the_record_is_only_read_for_a_quoted_value(self, app):
+        # Without a bed temperature, no plate needs the record either.
+        del app.db.filaments[PLAIN_ID]["temperatures"]["bed"]
         app.pull()
         assert app.db.record_reads == 0
         app.db.filaments[PLAIN_ID]["vendor"] = '"Maker"'

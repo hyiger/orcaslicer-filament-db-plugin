@@ -29,6 +29,7 @@ setting by setting, so a value that changed on both sides is refused rather than
 extra sync state needs to be kept. That only holds while the files match what OrcaSlicer loaded, so a
 reload that fails puts the old files back.
 """
+import functools
 import hashlib
 import http.client
 import json
@@ -126,6 +127,9 @@ PLATE_ROWS = {
     "Textured Cool Plate": ("textured_cool_plate_temp", "textured_cool_plate_temp_initial_layer"),
 }
 PLATE_ROW_KEYS = frozenset(key for keys in PLATE_ROWS.values() for key in keys)
+HOT_PLATE_KEYS = PLATE_ROWS["Hot Plate"]
+# The plate settings that take the filament's bed temperature when Filament DB has none of their own.
+PLATE_FALLBACK_KEYS = tuple(plate + suffix for plate in PLATE_KEYS for suffix in ("", "_initial_layer"))
 # These fields hold one value, and a filament with several extruder variants has one per variant.
 SINGLE_VALUE_KEYS = STRUCTURED_FIELDS.keys() | TEMPERATURE_FIELDS.keys()
 # OrcaSlicer's nozzle volume types, as Filament DB's one high-flow flag sees them. Hybrid is an extruder
@@ -172,12 +176,23 @@ class SyncError(Exception):
     """A failure to report to the user as it stands."""
 
 
+class Calibration(dict):
+    """The settings a calibration gives a preset. *every_bed* is False for one made for a single bed type,
+    whose bed temperatures are then that plate's alone."""
+
+    def __init__(self, keys=(), every_bed=True):
+        super().__init__(keys)
+        self.every_bed = every_bed
+
+
 class Api:
     def __init__(self, url, api_key, printer):
         self.url = url.rstrip("/")
         self.api_key = api_key
         self.printer = printer.strip()
         self.other_printers = set()
+        self.other_beds = set()
+        self.unknown_beds = set()
         if not self.url.startswith(("http://", "https://")):
             raise SyncError(f"The Filament DB URL must start with http:// or https://, not {url!r}.")
         self.opener = urllib.request.build_opener(SameOriginRedirects(self.url))
@@ -529,7 +544,8 @@ def bare_id(filament_id):
 
 
 def fetch_calibration(api, filament_id, nozzle):
-    """Return the calibration for the nozzle, leaving out one that belongs to another printer.
+    """Return the calibration for the nozzle, leaving out one that belongs to another printer, and
+    keeping one made for a single bed type to that bed's plate.
 
     The route falls back to any row for the nozzle, and a machine's retraction, temperatures and
     chamber settings do not carry over to another one.
@@ -539,13 +555,47 @@ def fetch_calibration(api, filament_id, nozzle):
     if api.printer:
         path += "&printer=" + urllib.parse.quote(api.printer)
     result = request_calibration(api, path, is_high_flow)
+    if not of_this_printer(api, result):
+        return Calibration()
+    if not result.get("bedType"):
+        return Calibration(result.get("calibration_orca", {}))
+    # Filament DB answers with a row for one bed type only when the filament has none for every bed type,
+    # and then with the first one. Each other plate's row has to be asked for by name.
+    calibration = scoped_to_bed(api, result)
+    for bed_type in [name for name in PLATE_ROWS if name != result["bedType"]["name"]]:
+        row = request_calibration(api, f"{path}&bed_type={urllib.parse.quote(bed_type)}", is_high_flow)
+        # The route falls back to another bed type's row when this one has none.
+        if ((row or {}).get("bedType") or {}).get("name") == bed_type and of_this_printer(api, row):
+            calibration.update(scoped_to_bed(api, row))
+    return calibration
+
+
+def of_this_printer(api, result):
+    """Return whether the route's answer is a calibration for any printer or for this one."""
     if not result:
-        return {}
+        return False
     printer = result.get("printer")
     if printer is None or printer.casefold() == api.printer.casefold():
-        return result.get("calibration_orca", {})
+        return True
     api.other_printers.add(printer)
-    return {}
+    return False
+
+
+def scoped_to_bed(api, result):
+    """Return the settings of a calibration made for a single bed type, kept to that bed's plate.
+
+    A preset has a bed temperature for each plate but one value for everything else, so only the bed
+    temperatures can stay with their plate, and none can when OrcaSlicer has no plate by that name.
+    """
+    keys = result.get("calibration_orca", {})
+    bed_type = result["bedType"]["name"]
+    if bed_type not in PLATE_ROWS:
+        api.unknown_beds.add(bed_type)
+        return Calibration(every_bed=False)
+    kept = {plate_key: keys[key] for key, plate_key in zip(HOT_PLATE_KEYS, PLATE_ROWS[bed_type]) if key in keys}
+    if len(kept) < len(keys):
+        api.other_beds.add(bed_type)
+    return Calibration(kept, every_bed=False)
 
 
 def request_calibration(api, path, is_high_flow):
@@ -573,7 +623,12 @@ def unquoted(value):
     return [unescaped(quoted[1]) if (quoted := QUOTED_STRING.fullmatch(item)) else item for item in value]
 
 
-def ini_keys(api, profile):
+def record_reader(api, profile):
+    """Return a function that reads the filament's record from Filament DB the first time it is called."""
+    return functools.cache(lambda: api.request(f"/api/filaments/{bare_id(profile['filament_id'])}"))
+
+
+def ini_keys(profile, record):
     """Return the settings whose exported value is the text of a PrusaSlicer INI line, quotes and all.
 
     Filament DB keeps such a setting as a string in its settings bag, and its own fields and the lists sent
@@ -586,7 +641,7 @@ def ini_keys(api, profile):
               if isinstance(value, list) and len(value) == 1 and QUOTED_STRING.fullmatch(value[0])]
     if not quoted:
         return set()
-    settings = api.request(f"/api/filaments/{bare_id(profile['filament_id'])}").get("settings") or {}
+    settings = record().get("settings") or {}
     # The export decodes INI text that runs over several lines itself, and a field wins over the
     # settings bag, so only a value exported just as the string is stored is still INI text.
     return {key for key in quoted if isinstance(settings.get(key), str) and profile[key] == [settings[key]]}
@@ -602,34 +657,72 @@ def orca_z_shrinkage(value):
     return [f"{round(number if number >= 50 else 100 - number, 4):g}%" for number in numbers]
 
 
-def prepare_profile(profile, calibration, filament_keys, ini):
+def bag_value(value):
+    """Return a value from Filament DB's settings bag as its export gives it, without the INI quotes."""
+    return [str(item) for item in value] if isinstance(value, list) else unquoted([str(value)])
+
+
+def own_bed_temperatures(settings, record):
+    """Return the filament's own bed temperatures, which a plate without one of its own takes.
+
+    The export puts a Hot Plate row over them, and that value is the Hot Plate's alone. Only the record
+    says whether there is such a row, so it is read only when a plate needs the value.
+    """
+    own = {key: settings[key] for key in HOT_PLATE_KEYS if key in settings}
+    if not own or all(key in settings for key in PLATE_FALLBACK_KEYS):
+        return own
+    filament = record()
+    temperatures = filament.get("temperatures") or {}
+    bag = filament.get("settings") or {}
+    for key in own.keys() & row_keys(filament):
+        # What the export gives without the row: the temperature field, or else the settings bag.
+        if temperatures.get(TEMPERATURE_FIELDS[key]) not in (None, ""):
+            own[key] = [str(temperatures[TEMPERATURE_FIELDS[key]])]
+        elif bag.get(key) is not None:
+            own[key] = bag_value(bag[key])
+        else:
+            del own[key]
+    return own
+
+
+def prepare_profile(profile, calibration, filament_keys, record):
     """Turn an exported profile into a preset that a live reload accepts.
 
     A reload refuses the whole bundle over one invalid preset, and a preset is invalid if it holds a
     known setting that does not belong in a filament preset. Filament DB's settings bag can hold
     anything, such as PrusaSlicer keys, so only the keys of a filament preset are kept. The same goes
     for "nil", which means not overridden, is refused by many settings, and is what leaving one out does.
-    The settings in *ini* are PrusaSlicer INI text, and lose its quoting.
+    Settings that are PrusaSlicer INI text lose its quoting. *record* reads the filament's record.
     """
+    ini = ini_keys(profile, record)
     settings = {key: unquoted(value) if key in ini else value for key, value in profile.items()}
     if "filament_colour" in settings:
         settings["default_filament_colour"] = settings.pop("filament_colour")
     for prusaslicer_key, orca_key in PRUSASLICER_KEYS.items():
         if prusaslicer_key in settings:
             settings.setdefault(orca_key, settings[prusaslicer_key])
+    beds = own_bed_temperatures(settings, record)
     settings.update(calibration)
+    if calibration.every_bed:
+        beds.update({key: calibration[key] for key in HOT_PLATE_KEYS if key in calibration})
+    # A calibrated plate's first layer follows its calibrated bed temperature, as the Hot Plate's does
+    # below, unless the filament has a first layer temperature of its own.
+    for temperature_key, first_layer_key in PLATE_ROWS.values():
+        if temperature_key in calibration:
+            settings.setdefault(first_layer_key, beds.get(HOT_PLATE_KEYS[1], calibration[temperature_key]))
     if "pressure_advance" in calibration:
         settings["enable_pressure_advance"] = ["1"]
     # PrusaSlicer's 0 means no limit. OrcaSlicer turns it into 0.5 when the preset is selected, as an
     # edit the user never made, and Send would write that back.
     if same_value(settings.get(MAX_VOLUMETRIC_SPEED_KEY), ["0"]):
         del settings[MAX_VOLUMETRIC_SPEED_KEY]
-    if "hot_plate_temp" in settings:
-        settings.setdefault("hot_plate_temp_initial_layer", settings["hot_plate_temp"])
+    for temperatures in (settings, beds):
+        if "hot_plate_temp" in temperatures:
+            temperatures.setdefault("hot_plate_temp_initial_layer", temperatures["hot_plate_temp"])
     for plate in PLATE_KEYS:
         for suffix in ("", "_initial_layer"):
-            if "hot_plate_temp" + suffix in settings:
-                settings.setdefault(plate + suffix, settings["hot_plate_temp" + suffix])
+            if "hot_plate_temp" + suffix in beds:
+                settings.setdefault(plate + suffix, beds["hot_plate_temp" + suffix])
     if settings.get(Z_SHRINKAGE_KEY) not in (None, ["nil"]):
         settings[Z_SHRINKAGE_KEY] = orca_z_shrinkage(settings[Z_SHRINKAGE_KEY])
 
@@ -642,7 +735,7 @@ def prepare_profile(profile, calibration, filament_keys, ini):
 
 def fetch_profiles(api, nozzle, filament_keys):
     return [prepare_profile(profile, fetch_calibration(api, profile["filament_id"], nozzle), filament_keys,
-                            ini_keys(api, profile))
+                            record_reader(api, profile))
             for profile in api.request("/api/filaments/orcaslicer")]
 
 
@@ -818,16 +911,25 @@ def pull(api):
         message += f" These were removed, so OrcaSlicer chose other presets for them: {key_list(replaced)}."
     if api.other_printers:
         message += f" Calibration tied to other printers was left out: {key_list(api.other_printers)}."
+    if api.other_beds:
+        message += (" Calibration tied to one bed type was left out, other than any bed temperature for its "
+                    f"plate: {key_list(api.other_beds)}.")
+    if api.unknown_beds:
+        message += (" Calibration for a bed type OrcaSlicer has no plate for was left out: "
+                    f"{key_list(api.unknown_beds)}.")
     return message
 
 
 def plate_row_keys(api, filament_id):
-    """Return the plate settings that Filament DB's bed type rows give this filament.
+    return row_keys(api.request(f"/api/filaments/{bare_id(filament_id)}"))
+
+
+def row_keys(record):
+    """Return the plate settings that Filament DB's bed type rows give the filament of *record*.
 
     The record lists a variant's rows as the export uses them, which are its parent's when it has none of
     its own. The export skips an empty value, so that setting still comes from the settings bag.
     """
-    record = api.request(f"/api/filaments/{bare_id(filament_id)}")
     return {key for row in record.get("bedTypeTemps") or []
             for field, key in zip(("temperature", "firstLayerTemperature"), PLATE_ROWS.get(row.get("bedType"), ()))
             if row.get(field) not in (None, "")}
@@ -864,7 +966,7 @@ def fetch_theirs(api, filament_id, nozzle, filament_keys):
     """Return Filament DB's export of the filament, its calibration for the nozzle, and the preset they make."""
     exported = fetch_export(api, filament_id)
     calibration = fetch_calibration(api, filament_id, nozzle)
-    return exported, calibration, prepare_profile(exported, calibration, filament_keys, ini_keys(api, exported))
+    return exported, calibration, prepare_profile(exported, calibration, filament_keys, record_reader(api, exported))
 
 
 def held_back_keys(api, filament_id, changes, calibration):
@@ -911,7 +1013,7 @@ def load_back(api, filament_id, calibration, filament_keys, bundle_dir, presets,
     """
     try:
         exported = fetch_export(api, filament_id)
-        theirs = prepare_profile(exported, calibration, filament_keys, ini_keys(api, exported))
+        theirs = prepare_profile(exported, calibration, filament_keys, record_reader(api, exported))
         install_bundle(bundle_dir, {**presets, stem: theirs})
     except Exception as error:
         raise SyncError(f"These edits were saved in Filament DB, but OrcaSlicer could not load them back: "

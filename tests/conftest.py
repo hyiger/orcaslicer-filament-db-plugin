@@ -205,6 +205,24 @@ class FakeBundles:
             self.filaments.select(selected, edits)
 
 
+def calibration_row(rows, printer, bed_type):
+    """Pick a row as src/app/api/filaments/[id]/calibration/route.ts does. A printer and a bed type only
+    put rows first, so the route falls back to a row for any printer, and then to one for any bed type."""
+    wanted = printer.strip().casefold()
+    generic = [row for row in rows if not row.get("printer")]
+    matching = [row for row in rows if wanted and (row.get("printer") or "").strip().casefold() == wanted]
+    if matching:
+        scoped = matching + generic
+    elif wanted:
+        scoped = generic or rows
+    else:
+        scoped = generic + [row for row in rows if row.get("printer")]
+    for row in scoped:
+        if bed_type and row.get("bedType") == bed_type:
+            return row
+    return next((row for row in scoped if not row.get("bedType")), scoped[0] if scoped else None)
+
+
 class FakeFilamentDb:
     """Follows src/app/api/filaments/**/route.ts in Filament DB."""
 
@@ -315,10 +333,7 @@ class FakeFilamentDb:
                     if "high_flow" in query:
                         wanted = query["high_flow"] == ["1"]
                         rows = [row for row in rows if "highFlow" in row and row["highFlow"] == wanted]
-                    wanted = query.get("printer", [""])[0].strip().casefold()
-                    # The real route only prioritizes a printer, and falls back to any row for the nozzle.
-                    row = next((row for row in rows if (row.get("printer") or "").casefold() == wanted),
-                               rows[0] if rows else None)
+                    row = calibration_row(rows, query.get("printer", [""])[0], query.get("bed_type", [""])[0])
                     if row is None:
                         self.reply(404, {"error": "No calibration found"})
                     elif query.get("format") != ["orcaslicer"]:
@@ -326,7 +341,8 @@ class FakeFilamentDb:
                     else:
                         # JSON leaves out a flag the nozzle does not have.
                         nozzle = {"highFlow": row["highFlow"]} if "highFlow" in row else {}
-                        self.reply(200, {"nozzle": nozzle, "printer": row.get("printer"),
+                        bed_type = {"name": row["bedType"], "material": "PEI"} if row.get("bedType") else None
+                        self.reply(200, {"nozzle": nozzle, "printer": row.get("printer"), "bedType": bed_type,
                                          "calibration_orca": row["keys"]})
                 else:
                     ids = query["ids"][0].split(",") if "ids" in query else sorted(db.filaments)

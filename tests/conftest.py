@@ -198,6 +198,8 @@ class FakeFilamentDb:
         self.fail_with = None
         self.record_reads = 0
         self.posts = []
+        # Stands for whatever happens once a post has been applied, such as the server going away.
+        self.after_post = None
         # The Authorization header of every request that got past the redirect, None when it had none.
         self.authorizations = []
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self.handler())
@@ -322,6 +324,9 @@ class FakeFilamentDb:
                         record[key] = value
                     else:
                         record.setdefault("settings", {})[key] = value
+                # Before the reply, so that it has happened by the time the plugin hears of the post.
+                if db.after_post:
+                    db.after_post()
                 self.reply(200, {"success": True})
 
         return Handler

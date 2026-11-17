@@ -686,23 +686,43 @@ def held_back_keys(api, filament_id, changes, calibration):
     return held_back & set(changes)
 
 
-def recheck(api, filament_id, nozzle, filament_keys, changes, sendable, ancestor):
+def recheck(api, filament_id, nozzle, filament_keys, changes, sendable, seen):
     """Check Filament DB again once the user has agreed, and return its export and calibration.
 
     The confirmation stays open for as long as the user likes, and a change made in Filament DB meanwhile
     would otherwise be overwritten without a word. Filament DB has no conditional write, so a change that
     lands between this read and the post can still be lost, but that window is a request long, not a
-    dialog long.
+    dialog long. *seen* is the preset made from Filament DB's values when the user was asked.
     """
     exported, calibration, theirs = fetch_theirs(api, filament_id, nozzle, filament_keys)
     held_back = held_back_keys(api, filament_id, changes, calibration)
-    # An edit that is now held back, or no longer is, would change what the user agreed to send.
+    # An edit that is now held back, or no longer is, would change what the user agreed to send. So would
+    # a new value for one that is sent, or for one left out because Filament DB already had it.
     changed = [key for key in changes if (key in held_back) == (key in sendable)
-               or key in sendable and not same_value(theirs.get(key), ancestor.get(key))]
+               or key in sendable and not same_value(theirs.get(key), seen.get(key))]
     if changed:
         raise SyncError(f"Nothing was sent, because these changed in Filament DB while you were deciding: "
                         f"{key_list(changed)}. Run Pull from Filament DB to see its values, then send again.")
     return exported, calibration
+
+
+def load_back(api, filament_id, calibration, filament_keys, bundle_dir, presets, stem, posted):
+    """Read the filament back from Filament DB after a post and load it, then return its preset.
+
+    The post has already saved the edits, so a failure here must not read as nothing having been sent.
+    install_bundle() puts the old files back, and the next send finds the edits in Filament DB already.
+    Only while they are unchanged, though: the bundle cannot remember the posted values, so a further
+    edit to one of them reads as a change made in Filament DB until a pull catches the bundle up.
+    """
+    try:
+        theirs = prepare_profile(fetch_export(api, filament_id), calibration, filament_keys)
+        install_bundle(bundle_dir, {**presets, stem: theirs})
+    except Exception as error:
+        raise SyncError(f"These edits were saved in Filament DB, but OrcaSlicer could not load them back: "
+                        f"{key_list(posted)}. Run Pull from Filament DB to bring OrcaSlicer up to date "
+                        f"before you change them again. "
+                        f"The error was: {error}") from error
+    return theirs
 
 
 def send(api):
@@ -732,8 +752,12 @@ def send(api):
     exported, calibration, theirs = fetch_theirs(api, filament_id, nozzle, filament_keys)
     held_back = held_back_keys(api, filament_id, changes, calibration)
     sendable = {key: value for key, value in changes.items() if key not in held_back}
+    # An earlier send can have saved these and then failed to load them back, which leaves the bundle on
+    # the old value. Filament DB holding the edit is no conflict, and it needs no second post.
+    already = {key for key, value in sendable.items() if same_value(theirs.get(key), value)}
+    posting = {key: value for key, value in sendable.items() if key not in already}
 
-    conflicts = [key for key in sendable if not same_value(theirs.get(key), ancestor.get(key))]
+    conflicts = [key for key in posting if not same_value(theirs.get(key), ancestor.get(key))]
     if conflicts:
         raise SyncError(f"Nothing was sent, because these also changed in Filament DB: {key_list(conflicts)}. "
                         "Run Pull from Filament DB to see its values, then send again.")
@@ -748,22 +772,26 @@ def send(api):
         if synced is None:
             raise SyncError("Nothing was sent, because OrcaSlicer has not loaded this filament's synced preset. "
                             "Run Pull from Filament DB, then send again.")
-        hidden = [key for key in sendable
+        hidden = [key for key in posting
                   if not same_value(theirs[key] if key in theirs else decode_value(key, synced.config_value(key) or ""),
                                     decode_value(key, selected.config_value(key) or ""))]
         if hidden:
             raise SyncError(f"Nothing was sent, because the synced preset shows other values for: {key_list(hidden)}. "
                             "Make the change on the synced preset instead.")
 
-    if sendable:
-        confirm_send(display_name(edited), sendable, theirs)
-        exported, calibration = recheck(api, filament_id, nozzle, filament_keys, changes, sendable, ancestor)
-        api.request(f"/api/filaments/{bare_id(filament_id)}/orcaslicer", request_body(sendable, exported))
-        theirs = prepare_profile(fetch_export(api, filament_id), calibration, filament_keys)
-    install_bundle(bundle_dir, {**presets, stem: theirs})
+    if posting:
+        confirm_send(display_name(edited), posting, theirs)
+        exported, calibration = recheck(api, filament_id, nozzle, filament_keys, changes, sendable, theirs)
+        api.request(f"/api/filaments/{bare_id(filament_id)}/orcaslicer", request_body(posting, exported))
+        theirs = load_back(api, filament_id, calibration, filament_keys, bundle_dir, presets, stem, posting)
+    else:
+        install_bundle(bundle_dir, {**presets, stem: theirs})
 
     dropped = [key for key, value in sendable.items() if not same_value(theirs.get(key), value)]
-    message = f"Sent {len(sendable) - len(dropped)} of {len(changes)} edits to Filament DB."
+    sent = [key for key in posting if key not in dropped]
+    message = f"Sent {len(sent)} of {len(changes)} edits to Filament DB."
+    if already:
+        message += f" These were in Filament DB already: {key_list(already)}."
     if held_back:
         message += f" Change these in Filament DB, as they cannot be sent: {key_list(held_back)}."
     if dropped:

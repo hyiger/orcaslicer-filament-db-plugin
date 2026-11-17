@@ -877,6 +877,125 @@ class TestChangesWhileConfirming:
         assert not app.db.posts
 
 
+class TestARefreshThatFailsAfterTheSend:
+    """Once the post succeeds the edit is in Filament DB, whatever happens to the read back or the reload."""
+
+    SAVED = ("These edits were saved in Filament DB, but OrcaSlicer could not load them back: nozzle_temperature. "
+             "Run Pull from Filament DB to bring OrcaSlicer up to date before you change them again. ")
+
+    def test_a_refused_reload_says_the_edit_was_saved(self, app):
+        """The issue as reported."""
+        edit(app, PLAIN, nozzle_temperature="222")
+        app.bundles.refuse = True
+        result = app.send()
+        assert result.status is PluginResult.Skipped
+        assert result.message == self.SAVED + "The error was: Local bundle contains an invalid preset"
+        assert app.db.filaments[PLAIN_ID]["temperatures"]["nozzle"] == "222"
+
+    def test_a_failed_read_back_says_the_edit_was_saved(self, app):
+        edit(app, PLAIN, nozzle_temperature="222")
+        app.db.after_post = lambda: setattr(app.db, "fail_with", (503, {"error": "Database is restarting"}))
+        result = app.send()
+        assert result.status is PluginResult.Skipped
+        assert result.message == self.SAVED + "The error was: Filament DB returned an error: Database is restarting"
+        assert app.db.filaments[PLAIN_ID]["temperatures"]["nozzle"] == "222"
+
+    def test_the_bundle_still_matches_what_orcaslicer_loaded(self, app):
+        """The files are the conflict check's ancestor, so a refused reload must leave them alone."""
+        edit(app, PLAIN, nozzle_temperature="222")
+        app.bundles.refuse = True
+        app.send()
+        assert bundle_preset(app, "Plain PLA")["nozzle_temperature"] == ["215"]
+        assert app.filaments.edited.config_value("nozzle_temperature") == "222"
+
+    def test_sending_again_is_not_a_conflict_and_posts_nothing(self, app):
+        edit(app, PLAIN, nozzle_temperature="222")
+        app.bundles.refuse = True
+        app.send()
+        app.bundles.refuse = False
+        result = app.send()
+        assert result.status is PluginResult.Success
+        assert result.message == ("Sent 0 of 1 edits to Filament DB. "
+                                  "These were in Filament DB already: nozzle_temperature.")
+        assert len(app.db.posts) == 1
+        assert bundle_preset(app, "Plain PLA")["nozzle_temperature"] == ["222"]
+        assert app.filaments.selected.config_value("nozzle_temperature") == "222"
+
+    def test_sending_again_asks_nothing_when_there_is_nothing_to_post(self, app):
+        edit(app, PLAIN, nozzle_temperature="222")
+        app.bundles.refuse = True
+        app.send()
+        app.bundles.refuse = False
+        app.orca.host.ui.dialogs.clear()
+        app.send()
+        assert not app.orca.host.ui.dialogs
+
+    def test_pulling_brings_orcaslicer_up_to_date(self, app):
+        edit(app, PLAIN, nozzle_temperature="222")
+        app.bundles.refuse = True
+        app.send()
+        app.bundles.refuse = False
+        app.pull()
+        assert bundle_preset(app, "Plain PLA")["nozzle_temperature"] == ["222"]
+        assert app.send().message == "There are no edits to send."
+
+    def test_a_further_edit_waits_for_a_pull(self, app):
+        """The bundle cannot remember what was posted, so the earlier value reads as Filament DB's own."""
+        edit(app, PLAIN, nozzle_temperature="222")
+        app.bundles.refuse = True
+        app.send()
+        app.bundles.refuse = False
+        app.filaments.edited.values["nozzle_temperature"] = "225"
+        assert "also changed in Filament DB: nozzle_temperature" in app.send().message
+        app.pull()
+        assert app.send().message == "Sent 1 of 1 edits to Filament DB."
+        assert app.db.filaments[PLAIN_ID]["temperatures"]["nozzle"] == "225"
+
+    def test_a_saved_copy_can_be_sent_again(self, app, plugin):
+        """The synced preset still shows the old value, which must not read as a stale copy."""
+        app.pull()
+        TestSend.saved_copy(None, app, plugin)
+        app.filaments.select("Edited Plain PLA", {"filament_density": "1.35"})
+        app.bundles.refuse = True
+        assert "were saved in Filament DB" in app.send().message
+        app.bundles.refuse = False
+        assert app.send().message == ("Sent 0 of 1 edits to Filament DB. "
+                                      "These were in Filament DB already: filament_density.")
+        assert len(app.db.posts) == 1
+
+    def test_a_failure_before_the_post_still_says_nothing_was_saved(self, app):
+        edit(app, CALIBRATED, filament_flow_ratio="0.9")
+        app.bundles.refuse = True
+        assert app.send().message == "Filament DB Sync failed: Local bundle contains an invalid preset"
+        assert not app.db.posts
+
+
+class TestAValueAlreadyInFilamentDb:
+    """Filament DB can hold the edit already, from a send whose refresh failed or from someone else."""
+
+    def test_is_not_a_conflict_and_the_other_edits_are_posted(self, app):
+        edit(app, PLAIN, nozzle_temperature="222", filament_density="1.3")
+        app.db.filaments[PLAIN_ID]["temperatures"]["nozzle"] = 222
+        assert app.send().message == ("Sent 1 of 2 edits to Filament DB. "
+                                      "These were in Filament DB already: nozzle_temperature.")
+        assert app.db.posts == [{"density": "1.3"}]
+
+    def test_is_left_out_of_the_confirmation(self, app):
+        edit(app, PLAIN, nozzle_temperature="222", filament_density="1.3")
+        app.db.filaments[PLAIN_ID]["temperatures"]["nozzle"] = 222
+        app.send()
+        assert app.orca.host.ui.dialogs == ['Send these changes to "Plain PLA" in Filament DB?\n\n'
+                                            "filament_density: 1.24 -> 1.3"]
+
+    def test_changed_while_confirming_stops_the_send(self, app):
+        """The user agreed to leave it alone because Filament DB had it, which no longer holds."""
+        edit(app, PLAIN, nozzle_temperature="222", filament_density="1.3")
+        app.db.filaments[PLAIN_ID]["temperatures"]["nozzle"] = 222
+        app.orca.host.ui.while_open = lambda: app.db.filaments[PLAIN_ID]["temperatures"].update(nozzle=230)
+        assert "while you were deciding: nozzle_temperature." in app.send().message
+        assert not app.db.posts
+
+
 class TestCalibration:
     def test_a_calibrated_value_is_held_back_and_the_rest_is_sent(self, app):
         edit(app, CALIBRATED, filament_flow_ratio="0.9", nozzle_temperature="225")

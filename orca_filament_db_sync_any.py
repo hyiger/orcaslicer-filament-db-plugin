@@ -132,8 +132,8 @@ HOT_PLATE_KEYS = PLATE_ROWS["Hot Plate"]
 PLATE_FALLBACK_KEYS = tuple(plate + suffix for plate in PLATE_KEYS for suffix in ("", "_initial_layer"))
 # These fields hold one value, and a filament with several extruder variants has one per variant.
 SINGLE_VALUE_KEYS = STRUCTURED_FIELDS.keys() | TEMPERATURE_FIELDS.keys()
-# OrcaSlicer's nozzle volume types, as Filament DB's one high-flow flag sees them. Hybrid is an extruder
-# holding nozzles of both kinds, so it does not say which calibration a filament prints with.
+# OrcaSlicer's nozzle volume types, as Filament DB's one high-flow flag sees them. Hybrid is left out: it
+# is an extruder holding nozzles of both kinds, so it does not say which calibration a filament prints with.
 HIGH_FLOW_VOLUME_TYPES = {"Standard": False, "High Flow": True, "TPU High Flow": True, "E3D High Flow": True,
                           "Extra High Flow": True}
 MAX_LISTED_CHANGES = 15
@@ -520,10 +520,9 @@ def high_flow(bundle):
     without saying which, Filament DB answers with either.
     """
     volume_type = (bundle.full_config_value("nozzle_volume_type") or "").split(",")[0].strip()
+    # Hybrid holds nozzles of both kinds, so it says nothing either, nor does a type this does not know.
     if volume_type not in HIGH_FLOW_VOLUME_TYPES:
-        raise SyncError(f"The printer's nozzle volume type is {volume_type!r}, so it is not clear whether its "
-                        "standard or its high-flow calibration applies. Nothing was changed. Set the volume "
-                        "type to Standard or to a high-flow type, then run this again.")
+        return None
     if HIGH_FLOW_VOLUME_TYPES[volume_type] or offers_high_flow(bundle):
         return HIGH_FLOW_VOLUME_TYPES[volume_type]
     # Profiles such as Prusa's HF nozzles do not list a high-flow variant, so OrcaSlicer leaves their volume
@@ -555,14 +554,18 @@ def fetch_calibration(api, filament_id, nozzle):
     if api.printer:
         path += "&printer=" + urllib.parse.quote(api.printer)
     result = request_calibration(api, path, is_high_flow)
-    if not of_this_printer(api, result):
+    if not result:
         return Calibration()
-    if not result.get("bedType"):
+    ours = of_this_printer(api, result)
+    if ours and not result.get("bedType"):
         return Calibration(result.get("calibration_orca", {}))
     # Filament DB answers with a row for one bed type only when the filament has none for every bed type,
-    # and then with the first one. Each other plate's row has to be asked for by name.
-    calibration = scoped_to_bed(api, result)
-    for bed_type in [name for name in PLATE_ROWS if name != result["bedType"]["name"]]:
+    # and then with the first one. Each other plate's row has to be asked for by name. With no printer set,
+    # it also puts another printer's row for every bed type ahead of a row for any printer made for one,
+    # so then every plate's row has to be asked for.
+    calibration = scoped_to_bed(api, result) if ours else Calibration(every_bed=False)
+    answered = result["bedType"]["name"] if ours else None
+    for bed_type in [name for name in PLATE_ROWS if name != answered]:
         row = request_calibration(api, f"{path}&bed_type={urllib.parse.quote(bed_type)}", is_high_flow)
         # The route falls back to another bed type's row when this one has none.
         if ((row or {}).get("bedType") or {}).get("name") == bed_type and of_this_printer(api, row):
@@ -572,8 +575,6 @@ def fetch_calibration(api, filament_id, nozzle):
 
 def of_this_printer(api, result):
     """Return whether the route's answer is a calibration for any printer or for this one."""
-    if not result:
-        return False
     printer = result.get("printer")
     if printer is None or printer.casefold() == api.printer.casefold():
         return True
@@ -747,9 +748,10 @@ def exports_of(api, filament_id):
 def fetch_export(api, filament_id):
     exported = exports_of(api, filament_id)
     if not exported:
-        # Pull refuses to remove a preset that has unsent edits, so they have to go first.
-        raise SyncError("Filament DB no longer has this filament. Discard the edits to it, "
-                        "then run Pull from Filament DB to remove its synced preset.")
+        # Pull refuses to remove a preset that has unsent edits, so they have to go first. A plugin pointed at
+        # the wrong copy of Filament DB gets the same answer, and there the edits are worth keeping.
+        raise SyncError(f"Filament DB at {api.url} does not have this filament. If that is the right address, "
+                        "discard the edits to it, then run Pull from Filament DB to remove its synced preset.")
     return exported[0]
 
 
@@ -864,9 +866,11 @@ def refuse_moved_edits(edited, presets):
         kept = presets.get(edited.name.removeprefix(BUNDLE_PRESET_PREFIX))
         if kept and kept["filament_id"] == filament_id:
             return
+        # A rename in Filament DB is not the only cause: a name an earlier version could not use everywhere,
+        # or a Windows folder path that grew, moves the file too.
         if any(profile["filament_id"] == filament_id for profile in presets.values()):
-            raise SyncError(f'"{display_name(edited)}" has unsent edits, and it was renamed in Filament DB. '
-                            "Send or discard them, then pull again. Nothing was changed.")
+            raise SyncError(f'"{display_name(edited)}" has unsent edits, and this pull gives its preset a new '
+                            "name. Send or discard them, then pull again. Nothing was changed.")
         raise SyncError(f'"{display_name(edited)}" has unsent edits, and it was removed from Filament DB. '
                         "Discard them, then pull again. Nothing was changed.")
 
@@ -1055,8 +1059,8 @@ def send(api):
         # A pull removes a filament's synced preset once Filament DB drops it, but a saved copy stays,
         # and telling the user to pull again would send them round in circles.
         if not exports_of(api, filament_id):
-            raise SyncError(f'"{display_name(edited)}" came from a filament that Filament DB no longer has, '
-                            "so there is nowhere to send it.")
+            raise SyncError(f'"{display_name(edited)}" came from a filament that Filament DB at {api.url} does '
+                            "not have, so there is nowhere to send it.")
         raise SyncError("This filament has not been pulled yet. Run Pull from Filament DB first.")
     ancestor = presets[stem]
 

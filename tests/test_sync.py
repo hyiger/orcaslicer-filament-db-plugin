@@ -11,8 +11,8 @@ from conftest import (BUNDLE_ID, CALIBRATED_ID, MOVED_PREFIX, PLAIN_ID, PLATE_RO
 
 PLAIN = f"_local/{BUNDLE_ID}/Plain PLA"
 CALIBRATED = f"_local/{BUNDLE_ID}/Calibrated PLA"
-REMOVED_TEXT = ("Filament DB no longer has this filament. Discard the edits to it, "
-                "then run Pull from Filament DB to remove its synced preset.")
+REMOVED_TEXT = ("Filament DB at {} does not have this filament. If that is the right address, discard the edits "
+                "to it, then run Pull from Filament DB to remove its synced preset.")
 
 
 def bundle_preset(app, name):
@@ -261,7 +261,8 @@ class TestPull:
         (filament_dir / "AUX_.json").rename(filament_dir / "AUX.json")
         app.bundles.reload_local(BUNDLE_ID)
         app.filaments.select(f"_local/{BUNDLE_ID}/AUX", {"filament_vendor": "Maker"})
-        assert "has unsent edits" in app.pull().message
+        assert app.pull().message == ('"AUX" has unsent edits, and this pull gives its preset a new name. '
+                                      "Send or discard them, then pull again. Nothing was changed.")
         assert (filament_dir / "AUX.json").exists()
 
     def test_finds_the_active_users_folder_and_leaves_no_trace_in_others(self, app, plugin):
@@ -322,7 +323,8 @@ class TestPull:
             app.db.filaments[PLAIN_ID]["name"] = "Renamed PLA"
         else:
             del app.db.filaments[PLAIN_ID]
-        assert f'"Plain PLA" has unsent edits, and it was {"renamed in" if change == "rename" else "removed from"}' in app.pull().message
+        moved = "this pull gives its preset a new name" if change == "rename" else "it was removed from Filament DB"
+        assert f'"Plain PLA" has unsent edits, and {moved}.' in app.pull().message
         assert bundle_preset(app, "Plain PLA") == before
 
     def test_unsent_edits_never_reach_a_filament_that_took_the_name(self, app):
@@ -829,7 +831,7 @@ class TestSend:
     def test_a_filament_deleted_in_filament_db_is_reported(self, app):
         edit(app, PLAIN, nozzle_temperature="222")
         del app.db.filaments[PLAIN_ID]
-        assert app.send().message == REMOVED_TEXT
+        assert app.send().message == REMOVED_TEXT.format(app.db.url)
 
     @pytest.mark.parametrize("emptied", [False, True])
     def test_the_advice_for_a_deleted_filament_removes_its_preset(self, app, emptied):
@@ -870,11 +872,11 @@ class TestSend:
         self.saved_copy(app, plugin)
         app.filaments.select("Edited Plain PLA", {"filament_density": "1.35"})
         del app.db.filaments[PLAIN_ID]
-        assert app.send().message == REMOVED_TEXT
+        assert app.send().message == REMOVED_TEXT.format(app.db.url)
         assert app.pull().message.startswith("Pulled 1 filaments")
         app.filaments.select("Edited Plain PLA", {"filament_density": "1.35"})
-        assert app.send().message == ('"Edited Plain PLA" came from a filament that Filament DB no longer has, '
-                                      "so there is nowhere to send it.")
+        assert app.send().message == (f'"Edited Plain PLA" came from a filament that Filament DB at {app.db.url} '
+                                      "does not have, so there is nowhere to send it.")
         assert not app.db.posts
 
     def test_a_synced_preset_is_judged_by_its_file_not_its_loaded_value(self, app):
@@ -1273,6 +1275,20 @@ class TestBedSpecificValues:
         assert bundle_preset(app, "Plain PLA")["textured_plate_temp"] == ["60"]
         assert message.endswith("Calibration tied to other printers was left out: MK4.")
 
+    def test_a_plates_calibration_for_any_printer_is_found_behind_another_printers(self, app):
+        """With no printer set, Filament DB answers with another printer's row for every bed type first."""
+        app.db.calibrations[(PLAIN_ID, "0.4")] = [
+            {"bedType": "Textured PEI Plate", "keys": {"hot_plate_temp": ["65"]}},
+            {"printer": "Core One", "keys": {"filament_flow_ratio": ["0.8"]}}]
+        message = app.pull().message
+        preset = bundle_preset(app, "Plain PLA")
+        assert (preset["textured_plate_temp"], preset["hot_plate_temp"]) == (["65"], ["60"])
+        assert preset.get("filament_flow_ratio") != ["0.8"]
+        assert message.endswith("Calibration tied to other printers was left out: Core One.")
+        edit(app, PLAIN, textured_plate_temp="70")
+        assert "cannot be sent: textured_plate_temp" in app.send().message
+        assert not app.db.posts
+
     def test_a_calibration_for_every_bed_type_comes_first(self, app):
         app.db.calibrations[(PLAIN_ID, "0.4")] = [self.HOT_PLATE_CALIBRATION, {"keys": {"nozzle_temperature": ["230"]}}]
         assert app.pull().message == "Pulled 2 filaments from Filament DB for a 0.4 mm nozzle."
@@ -1413,7 +1429,7 @@ class TestChangesWhileConfirming:
     def test_a_filament_deleted_while_confirming_is_reported(self, app):
         edit(app, PLAIN, nozzle_temperature="222")
         app.orca.host.ui.while_open = lambda: app.db.filaments.pop(PLAIN_ID)
-        assert app.send().message == REMOVED_TEXT
+        assert app.send().message == REMOVED_TEXT.format(app.db.url)
         assert not app.db.posts
 
 
@@ -1690,20 +1706,14 @@ class TestStandardAndHighFlowNozzles:
         assert bundle_preset(app, "Plain PLA")["pressure_advance"] == ["0.02"]
 
     @pytest.mark.parametrize("volume_type", ["Hybrid", None, "", "Something New"])
-    def test_a_nozzle_that_is_not_clearly_one_or_the_other_stops_the_pull(self, app, volume_type):
+    def test_a_nozzle_that_is_not_clearly_one_or_the_other_gets_either_row(self, app, volume_type):
+        """Hybrid holds nozzles of both kinds, so like an unknown type it does not narrow the calibration."""
         app.state.volume_type = volume_type
-        result = app.pull()
-        assert result.status is PluginResult.Skipped
-        assert result.message == (f"The printer's nozzle volume type is {volume_type or ''!r}, so it is not "
-                                  "clear whether its standard or its high-flow calibration applies. Nothing "
-                                  "was changed. Set the volume type to Standard or to a high-flow type, then "
-                                  "run this again.")
-        assert not (app.bundle_dir / "filament").exists()
-
-    def test_a_hybrid_nozzle_stops_a_send(self, app):
-        edit(app, PLAIN, nozzle_temperature="225")
-        app.state.volume_type = "Hybrid"
-        assert "Nothing was changed" in app.send().message
+        app.db.calibrations[(PLAIN_ID, "0.4")] = [self.HIGH_FLOW]
+        assert app.pull().message.endswith("for a 0.4 mm nozzle.")
+        assert bundle_preset(app, "Plain PLA")["pressure_advance"] == ["0.02"]
+        edit(app, PLAIN, pressure_advance="0.03")
+        assert "cannot be sent: pressure_advance" in app.send().message
         assert not app.db.posts
 
 

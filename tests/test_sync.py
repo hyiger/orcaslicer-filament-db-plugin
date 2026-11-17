@@ -576,6 +576,34 @@ class TestSend:
                                       "preset. Run Pull from Filament DB, then send again.")
         assert not app.db.posts
 
+    def test_a_copys_edit_to_a_setting_filament_db_exports_needs_no_loaded_synced_preset(self, app, plugin):
+        app.pull()
+        self.saved_copy(app, plugin)
+        del app.filaments.presets[PLAIN]
+        app.filaments.select("Edited Plain PLA", {"nozzle_temperature": "222"})
+        assert app.send().message == "Sent 1 of 1 edits to Filament DB."
+        assert app.db.posts == [{"temperatures": {"nozzle": "222"}}]
+
+    def test_a_copys_held_back_edit_needs_no_loaded_synced_preset(self, app, plugin):
+        app.db.filaments[PLAIN_ID]["bedTypeTemps"] = [{"bedType": "Cool Plate", "temperature": 45}]
+        app.pull()
+        self.saved_copy(app, plugin)
+        del app.filaments.presets[PLAIN]
+        app.filaments.select("Edited Plain PLA", {"cool_plate_temp": "50"})
+        assert app.send().message == ("Sent 0 of 1 edits to Filament DB. Change these in Filament DB, "
+                                      "as they cannot be sent: cool_plate_temp.")
+        assert not app.db.posts
+
+    def test_a_copys_edit_already_in_filament_db_needs_no_loaded_synced_preset(self, app, plugin):
+        app.pull()
+        self.saved_copy(app, plugin)
+        del app.filaments.presets[PLAIN]
+        app.filaments.select("Edited Plain PLA", {"fan_max_speed": "70"})
+        app.db.filaments[PLAIN_ID]["settings"] = {"fan_max_speed": ["70"]}
+        assert app.send().message == ("Sent 0 of 1 edits to Filament DB. "
+                                      "These were in Filament DB already: fan_max_speed.")
+        assert not app.db.posts
+
     def test_a_copy_showing_orcaslicers_own_value_can_set_one_in_filament_db(self, app, plugin):
         app.pull()
         self.saved_copy(app, plugin)

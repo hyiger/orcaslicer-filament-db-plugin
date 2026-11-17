@@ -16,7 +16,15 @@ env:
   PLUGIN_FILES: "orca_filament_db_sync_any.py"
 
 jobs:
+  # The release event checks out the tag, so this tests the exact commit that is about to be uploaded.
+  test:
+    uses: ./.github/workflows/test.yml
+    # Otherwise the tests would inherit id-token: write from the top of this file, which only publishing needs.
+    permissions:
+      contents: read
+
   publish:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

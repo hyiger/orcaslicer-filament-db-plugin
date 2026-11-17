@@ -70,6 +70,15 @@ python -m venv .venv
 
 `pytest` fails below 100% line and branch coverage. Tests run against a stand-in for OrcaSlicer's `orca` module and a stand-in Filament DB served over real HTTP, in `tests/conftest.py`. Both hold the rules found by testing in OrcaSlicer: a reload refuses a whole bundle over one invalid preset, `find_preset()` returns the edited copy of the selected preset, and the sync route takes a bare id.
 
+## Publishing
+
+Each GitHub release publishes `orca_filament_db_sync_any.py` to the plugin's Orca Cloud listing, through `.github/workflows/publish-orcacloud.yml`, which follows [Orca Cloud's guide](https://cloud.orcaslicer.com/wiki/). The repository must first be connected to the listing, in its **Edit plugin** > **GitHub publishing**.
+
+1. Raise `version` in the plugin's header and push.
+2. Create a release whose tag is that version with a `v`, such as `v1.2.0`. Orca Cloud needs it higher than the listing's current version. The release notes become the changelog.
+
+The workflow stops if the tag is not the header's version.
+
 ## Testing in OrcaSlicer
 
 The unit tests cannot reach the steps below, which need the running app. Use a copy of Filament DB with data you can lose.

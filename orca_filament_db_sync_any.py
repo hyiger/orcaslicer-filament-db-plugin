@@ -113,10 +113,18 @@ TEMPERATURE_FIELDS = {
     "nozzle_temperature_range_high": "nozzleRangeMax",
     "nozzle_temperature_range_low": "nozzleRangeMin",
 }
-# Filament DB keeps a bed type's own temperature in a row that its export prefers over the plain bed
-# temperature, and the sync route can only write the plain one.
-HOT_PLATE_KEYS = frozenset({"hot_plate_temp", "hot_plate_temp_initial_layer"})
-HOT_PLATE_ROW = "Hot Plate"
+# Filament DB keeps a bed type's own temperatures in a row, which its export puts over the settings bag
+# and the plain bed temperature. The sync route cannot write a row, so an edit sent for one of these
+# settings would be stored out of sight and turn up once the row is removed. Each row gives the
+# settings for its temperature and then for its first layer temperature.
+PLATE_ROWS = {
+    "Cool Plate": ("cool_plate_temp", "cool_plate_temp_initial_layer"),
+    "Engineering Plate": ("eng_plate_temp", "eng_plate_temp_initial_layer"),
+    "Hot Plate": ("hot_plate_temp", "hot_plate_temp_initial_layer"),
+    "Textured PEI Plate": ("textured_plate_temp", "textured_plate_temp_initial_layer"),
+    "Textured Cool Plate": ("textured_cool_plate_temp", "textured_cool_plate_temp_initial_layer"),
+}
+PLATE_ROW_KEYS = frozenset(key for keys in PLATE_ROWS.values() for key in keys)
 # These fields hold one value, and a filament with several extruder variants has one per variant.
 SINGLE_VALUE_KEYS = STRUCTURED_FIELDS.keys() | TEMPERATURE_FIELDS.keys()
 MAX_LISTED_CHANGES = 15
@@ -618,9 +626,16 @@ def pull(api):
     return message
 
 
-def has_hot_plate_row(api, filament_id):
+def plate_row_keys(api, filament_id):
+    """Return the plate settings that Filament DB's bed type rows give this filament.
+
+    The record lists a variant's rows as the export uses them, which are its parent's when it has none of
+    its own. The export skips an empty value, so that setting still comes from the settings bag.
+    """
     record = api.request(f"/api/filaments/{bare_id(filament_id)}")
-    return any(row.get("bedType") == HOT_PLATE_ROW for row in record.get("bedTypeTemps") or [])
+    return {key for row in record.get("bedTypeTemps") or []
+            for field, key in zip(("temperature", "firstLayerTemperature"), PLATE_ROWS.get(row.get("bedType"), ()))
+            if row.get(field) not in (None, "")}
 
 
 def confirmed(question, title):
@@ -683,8 +698,9 @@ def send(api):
     held_back = set(calibration) | FIELD_ONLY_KEYS
     if "pressure_advance" in calibration:
         held_back.add("enable_pressure_advance")
-    if HOT_PLATE_KEYS & set(changes) and has_hot_plate_row(api, filament_id):
-        held_back |= HOT_PLATE_KEYS
+    # Only an edited plate setting is worth asking Filament DB for the record.
+    if PLATE_ROW_KEYS & set(changes):
+        held_back |= plate_row_keys(api, filament_id)
     held_back |= {key for key, value in changes.items() if key in SINGLE_VALUE_KEYS and len(value) > 1}
     held_back &= set(changes)
     sendable = {key: value for key, value in changes.items() if key not in held_back}

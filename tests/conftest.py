@@ -43,6 +43,15 @@ FILAMENT_KEYS = [
 INVALID_IN_A_PRESET = {"filament_colour", "temperature"}
 NULLABLE_KEYS = {"filament_retraction_length", "filament_retraction_speed", "filament_deretraction_speed",
                  "filament_z_hop", "filament_z_hop_types"}
+# BED_TYPE_KEY_MAP in Filament DB's src/lib/orcaSlicerBundle.ts: the settings a bed type row exports,
+# for its temperature and then its first layer temperature.
+PLATE_ROWS = {
+    "Cool Plate": ("cool_plate_temp", "cool_plate_temp_initial_layer"),
+    "Engineering Plate": ("eng_plate_temp", "eng_plate_temp_initial_layer"),
+    "Hot Plate": ("hot_plate_temp", "hot_plate_temp_initial_layer"),
+    "Textured PEI Plate": ("textured_plate_temp", "textured_plate_temp_initial_layer"),
+    "Textured Cool Plate": ("textured_cool_plate_temp", "textured_cool_plate_temp_initial_layer"),
+}
 # A path under this answers with a redirect, the way a server that moved or sits behind a proxy does.
 MOVED_PREFIX = "/old"
 
@@ -196,8 +205,16 @@ class FakeFilamentDb:
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
         self.moved_to = self.url
 
-    def export(self, filament_id):
+    def resolved(self, filament_id):
+        """Return the record as resolveFilament() does: a variant with no bed type rows has its parent's."""
         record = self.filaments[filament_id]
+        parent = self.filaments.get(record.get("parentId"))
+        if parent and not record.get("bedTypeTemps"):
+            return {**record, "bedTypeTemps": parent.get("bedTypeTemps") or []}
+        return record
+
+    def export(self, filament_id):
+        record = self.resolved(filament_id)
         keys = {key: list(value) for key, value in record.get("settings", {}).items()}
         temperatures = record.get("temperatures", {})
         if "notes" in record and "filament_notes" not in keys:
@@ -213,9 +230,11 @@ class FakeFilamentDb:
                   "hot_plate_temp": temperatures.get("bed"),
                   "hot_plate_temp_initial_layer": temperatures.get("bedFirstLayer"),
                   "filament_shrinkage_compensation_z": record.get("shrinkageZ")}
-        for row in record.get("bedTypeTemps", []):
-            if row["bedType"] == "Hot Plate":
-                fields["hot_plate_temp"] = row["temperature"]
+        # A row's value wins over the settings bag and the plain bed temperature, and an empty one is skipped.
+        for row in record.get("bedTypeTemps") or []:
+            for field, key in zip(("temperature", "firstLayerTemperature"), PLATE_ROWS.get(row["bedType"], ())):
+                if row.get(field) not in (None, ""):
+                    fields[key] = row[field]
         if record.get("shrinkageXY") is not None:
             fields["filament_shrink"] = f"{100 - record['shrinkageXY']}%"
         for key, source in fields.items():
@@ -267,7 +286,7 @@ class FakeFilamentDb:
                 record = re.fullmatch(r"/api/filaments/([^/]+)", url.path)
                 if record and record[1] != "orcaslicer":
                     db.record_reads += 1
-                    self.reply(200, db.filaments[record[1]])
+                    self.reply(200, db.resolved(record[1]))
                     return
                 match = re.fullmatch(r"/api/filaments/([^/]+)/calibration", url.path)
                 if match:

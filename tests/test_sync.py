@@ -6,7 +6,8 @@ import threading
 
 import pytest
 
-from conftest import BUNDLE_ID, CALIBRATED_ID, MOVED_PREFIX, PLAIN_ID, FakePreset, NotificationLevel, PluginResult
+from conftest import (BUNDLE_ID, CALIBRATED_ID, MOVED_PREFIX, PLAIN_ID, PLATE_ROWS, FakePreset, NotificationLevel,
+                      PluginResult)
 
 PLAIN = f"_local/{BUNDLE_ID}/Plain PLA"
 CALIBRATED = f"_local/{BUNDLE_ID}/Calibrated PLA"
@@ -646,21 +647,6 @@ class TestSend:
     def test_a_long_value_is_shortened(self, plugin):
         assert plugin.shown_value(["x" * 60]) == "x" * 40 + "..."
 
-    def test_a_filament_with_a_hot_plate_row_holds_the_bed_temperature_back(self, app):
-        """The route would change the plain bed temperature, which the export does not even show."""
-        app.db.filaments[PLAIN_ID]["bedTypeTemps"] = [{"bedType": "Hot Plate", "temperature": 70}]
-        edit(app, PLAIN, hot_plate_temp="75")
-        assert "cannot be sent: hot_plate_temp" in app.send().message
-        assert not app.db.posts
-
-    def test_the_record_is_only_read_for_a_bed_temperature(self, app):
-        edit(app, PLAIN, nozzle_temperature="222")
-        app.send()
-        assert app.db.record_reads == 0
-        edit(app, PLAIN, hot_plate_temp="65")
-        assert app.send().message == "Sent 1 of 1 edits to Filament DB."
-        assert app.db.record_reads == 1
-
     def test_an_edit_of_one_extruder_variant_is_held_back(self, app):
         """These fields hold one value, so only the first variant's would survive."""
         edit(app, PLAIN, nozzle_temperature="220,235")
@@ -677,6 +663,85 @@ class TestSend:
         edit(app, PLAIN, filament_shrinkage_compensation_z="99.5%")
         assert "Sent 0 of 1" in app.send().message
         assert not app.db.posts
+
+
+class TestPlateRows:
+    """Filament DB exports a bed type row over the settings bag and the plain bed temperature, and the
+    sync route cannot write a row, so an edit sent for one would be stored out of sight."""
+
+    @pytest.mark.parametrize("bed_type, key", [
+        (bed_type, key) for bed_type, keys in PLATE_ROWS.items() for key in keys
+    ])
+    def test_an_edit_to_a_plate_with_a_row_is_held_back(self, app, bed_type, key):
+        app.db.filaments[PLAIN_ID]["bedTypeTemps"] = [
+            {"bedType": bed_type, "temperature": 70, "firstLayerTemperature": 70}]
+        edit(app, PLAIN, **{key: "75"})
+        assert app.send().message == (f"Sent 0 of 1 edits to Filament DB. Change these in Filament DB, "
+                                      f"as they cannot be sent: {key}.")
+        assert not app.db.posts
+
+    def test_a_held_back_edit_does_not_turn_up_once_the_row_is_removed(self, app):
+        """The issue as reported: the value would wait in the settings bag behind the row."""
+        app.db.filaments[PLAIN_ID]["bedTypeTemps"] = [{"bedType": "Textured PEI Plate", "temperature": 70}]
+        edit(app, PLAIN, textured_plate_temp="75")
+        app.send()
+        assert bundle_preset(app, "Plain PLA")["textured_plate_temp"] == ["70"]
+        del app.db.filaments[PLAIN_ID]["bedTypeTemps"]
+        app.pull()
+        assert bundle_preset(app, "Plain PLA")["textured_plate_temp"] == ["60"]
+
+    def test_the_other_edits_are_still_sent(self, app):
+        app.db.filaments[PLAIN_ID]["bedTypeTemps"] = [{"bedType": "Cool Plate", "temperature": 45}]
+        edit(app, PLAIN, cool_plate_temp="50", nozzle_temperature="222")
+        assert app.send().message == ("Sent 1 of 2 edits to Filament DB. Change these in Filament DB, "
+                                      "as they cannot be sent: cool_plate_temp.")
+        assert app.db.posts == [{"temperatures": {"nozzle": "222"}}]
+
+    def test_a_value_the_row_leaves_empty_is_sent(self, app):
+        """The export skips an empty value, so the setting comes from the settings bag."""
+        app.db.filaments[PLAIN_ID]["bedTypeTemps"] = [
+            {"bedType": "Textured PEI Plate", "temperature": 70, "firstLayerTemperature": None}]
+        edit(app, PLAIN, textured_plate_temp_initial_layer="72")
+        assert app.send().message == "Sent 1 of 1 edits to Filament DB."
+        assert bundle_preset(app, "Plain PLA")["textured_plate_temp_initial_layer"] == ["72"]
+
+    def test_the_first_layer_bed_temperature_is_sent_beside_a_hot_plate_row_without_one(self, app):
+        app.db.filaments[PLAIN_ID]["bedTypeTemps"] = [{"bedType": "Hot Plate", "temperature": 70}]
+        edit(app, PLAIN, hot_plate_temp_initial_layer="68")
+        assert app.send().message == "Sent 1 of 1 edits to Filament DB."
+        assert app.db.posts == [{"temperatures": {"bedFirstLayer": "68"}}]
+
+    def test_a_row_for_a_bed_type_the_export_does_not_know_is_ignored(self, app):
+        """Rows are free text, and one named for PrusaSlicer, such as Textured PEI, never reaches Orca."""
+        app.db.filaments[PLAIN_ID]["bedTypeTemps"] = [{"bedType": "Textured PEI", "temperature": 70}]
+        edit(app, PLAIN, textured_plate_temp="75")
+        assert app.send().message == "Sent 1 of 1 edits to Filament DB."
+
+    def test_a_row_inherited_from_the_parent_holds_the_edit_back(self, app):
+        app.db.filaments["c" * 24] = {"name": "PLA Template", "type": "PLA", "vendor": "Spike",
+                                      "bedTypeTemps": [{"bedType": "Engineering Plate", "temperature": 65,
+                                                        "firstLayerTemperature": 70}]}
+        app.db.filaments[PLAIN_ID]["parentId"] = "c" * 24
+        edit(app, PLAIN, eng_plate_temp_initial_layer="72")
+        assert "cannot be sent: eng_plate_temp_initial_layer" in app.send().message
+        assert not app.db.posts
+
+    def test_a_variant_with_rows_of_its_own_does_not_inherit_the_parents(self, app):
+        """Filament DB inherits the rows as a whole list, not one bed type at a time."""
+        app.db.filaments["c" * 24] = {"name": "PLA Template", "type": "PLA", "vendor": "Spike",
+                                      "bedTypeTemps": [{"bedType": "Engineering Plate", "temperature": 65}]}
+        app.db.filaments[PLAIN_ID].update(parentId="c" * 24,
+                                          bedTypeTemps=[{"bedType": "Cool Plate", "temperature": 45}])
+        edit(app, PLAIN, eng_plate_temp="70")
+        assert app.send().message == "Sent 1 of 1 edits to Filament DB."
+
+    def test_the_record_is_only_read_for_a_plate_temperature(self, app):
+        edit(app, PLAIN, nozzle_temperature="222", supertack_plate_temp="55")
+        app.send()
+        assert app.db.record_reads == 0
+        edit(app, PLAIN, textured_cool_plate_temp_initial_layer="65")
+        assert app.send().message == "Sent 1 of 1 edits to Filament DB."
+        assert app.db.record_reads == 1
 
 
 class TestConflicts:

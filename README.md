@@ -12,7 +12,7 @@ Keeps OrcaSlicer's filament presets in step with [Filament DB](https://github.co
 
 **Send to Filament DB** shows your unsaved changes to the selected filament, old value and new, and sends them once you press OK. It then pulls that filament back. It sends only those settings, so a variant keeps inheriting everything else from its parent.
 
-To select the filaments loaded in a Prusa printer, use [PrusaLink Filament Match](https://github.com/hyiger/orcaslicer-prusalink-filament-match), a separate plugin. It can select the presets this one pulls.
+To select the filaments loaded in a Prusa printer, use [PrusaLink Filament Sync](https://github.com/hyiger/orcaslicer-prusalink-filament-sync), a separate plugin. It can select the presets this one pulls.
 
 ## Settings
 

@@ -741,7 +741,8 @@ class TestPlateRows:
         assert app.db.record_reads == 0
         edit(app, PLAIN, textured_cool_plate_temp_initial_layer="65")
         assert app.send().message == "Sent 1 of 1 edits to Filament DB."
-        assert app.db.record_reads == 1
+        # Once to ask, and once more after the confirmation in case a row was added meanwhile.
+        assert app.db.record_reads == 2
 
 
 class TestConflicts:
@@ -792,6 +793,88 @@ class TestConflicts:
         app.pull()
         assert app.filaments.edited.config_value("nozzle_temperature") == "240"
         assert app.send().message == "Sent 1 of 1 edits to Filament DB."
+
+
+class TestChangesWhileConfirming:
+    """The confirmation stays open for as long as the user likes, and Filament DB can change meanwhile."""
+
+    def test_a_value_changed_in_filament_db_while_confirming_is_not_overwritten(self, app):
+        """The issue as reported."""
+        edit(app, PLAIN, nozzle_temperature="222")
+        app.orca.host.ui.while_open = lambda: app.db.filaments[PLAIN_ID]["temperatures"].update(nozzle=230)
+        result = app.send()
+        assert result.status is PluginResult.Skipped
+        assert result.message == ("Nothing was sent, because these changed in Filament DB while you were deciding: "
+                                  "nozzle_temperature. Run Pull from Filament DB to see its values, then send again.")
+        assert not app.db.posts
+        assert app.db.filaments[PLAIN_ID]["temperatures"]["nozzle"] == 230
+
+    def test_the_local_edit_is_kept_for_review(self, app):
+        edit(app, PLAIN, nozzle_temperature="222")
+        app.orca.host.ui.while_open = lambda: app.db.filaments[PLAIN_ID]["temperatures"].update(nozzle=230)
+        app.send()
+        assert app.filaments.edited.is_dirty
+        assert app.filaments.edited.config_value("nozzle_temperature") == "222"
+        assert bundle_preset(app, "Plain PLA")["nozzle_temperature"] == ["215"]
+
+    def test_none_of_the_edits_is_sent(self, app):
+        edit(app, PLAIN, nozzle_temperature="222", filament_density="1.3")
+        app.orca.host.ui.while_open = lambda: app.db.filaments[PLAIN_ID]["temperatures"].update(nozzle=230)
+        assert "while you were deciding: nozzle_temperature." in app.send().message
+        assert not app.db.posts
+        assert app.db.filaments[PLAIN_ID]["density"] == 1.24
+
+    def test_a_change_to_another_setting_while_confirming_does_not_stop_the_send(self, app):
+        edit(app, PLAIN, nozzle_temperature="222")
+        app.orca.host.ui.while_open = lambda: app.db.filaments[PLAIN_ID].update(density=1.5)
+        assert app.send().message == "Sent 1 of 1 edits to Filament DB."
+        assert app.db.filaments[PLAIN_ID]["density"] == 1.5
+        assert bundle_preset(app, "Plain PLA")["filament_density"] == ["1.5"]
+
+    def test_calibration_changed_while_confirming_is_what_the_synced_preset_gets(self, app):
+        """The synced preset is the ancestor for the next send, so an old value would show up as a conflict."""
+        edit(app, CALIBRATED, nozzle_temperature="225")
+        app.orca.host.ui.while_open = lambda: app.db.calibrations.update(
+            {(CALIBRATED_ID, "0.4"): [{"keys": {"filament_flow_ratio": ["0.97"], "pressure_advance": ["0.05"]}}]})
+        assert app.send().message == "Sent 1 of 1 edits to Filament DB."
+        assert bundle_preset(app, "Calibrated PLA")["pressure_advance"] == ["0.05"]
+
+    def test_a_setting_renamed_while_confirming_goes_under_its_new_name(self, app):
+        app.db.filaments[PLAIN_ID]["settings"] = {"filament_flow_ratio": ["1.05"]}
+        edit(app, PLAIN, filament_flow_ratio="1.02")
+        app.orca.host.ui.while_open = lambda: app.db.filaments[PLAIN_ID].update(
+            settings={"extrusion_multiplier": ["1.05"]})
+        assert app.send().message == "Sent 1 of 1 edits to Filament DB."
+        assert app.db.filaments[PLAIN_ID]["settings"] == {"extrusion_multiplier": ["1.02"]}
+
+    def test_calibration_added_while_confirming_stops_the_send(self, app):
+        """The edit would now be held back, which is not what the user agreed to, even at the same value."""
+        edit(app, PLAIN, nozzle_temperature="222")
+        app.orca.host.ui.while_open = lambda: app.db.calibrations.update(
+            {(PLAIN_ID, "0.4"): [{"keys": {"nozzle_temperature": ["215"]}}]})
+        assert "while you were deciding: nozzle_temperature." in app.send().message
+        assert not app.db.posts
+
+    def test_calibration_removed_while_confirming_sends_nothing_unconfirmed(self, app):
+        """The held back edit would become sendable without the user having seen it."""
+        edit(app, CALIBRATED, filament_flow_ratio="0.9", nozzle_temperature="225")
+        app.orca.host.ui.while_open = lambda: app.db.calibrations.pop((CALIBRATED_ID, "0.4"))
+        assert "while you were deciding: filament_flow_ratio." in app.send().message
+        assert not app.db.posts
+
+    def test_a_plate_row_added_while_confirming_stops_the_send(self, app):
+        edit(app, PLAIN, textured_plate_temp="75")
+        app.orca.host.ui.while_open = lambda: app.db.filaments[PLAIN_ID].update(
+            bedTypeTemps=[{"bedType": "Textured PEI Plate", "temperature": 60}])
+        assert "while you were deciding: textured_plate_temp." in app.send().message
+        assert not app.db.posts
+
+    def test_a_filament_deleted_while_confirming_is_reported(self, app):
+        edit(app, PLAIN, nozzle_temperature="222")
+        app.orca.host.ui.while_open = lambda: app.db.filaments.pop(PLAIN_ID)
+        assert app.send().message == ("Filament DB no longer has this filament. "
+                                      "Run Pull from Filament DB to remove it.")
+        assert not app.db.posts
 
 
 class TestCalibration:

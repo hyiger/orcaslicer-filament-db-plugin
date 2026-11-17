@@ -665,6 +665,46 @@ def confirm_send(name, sendable, theirs):
         raise SyncError("Nothing was sent.")
 
 
+def fetch_theirs(api, filament_id, nozzle, filament_keys):
+    """Return Filament DB's export of the filament, its calibration for the nozzle, and the preset they make."""
+    exported = fetch_export(api, filament_id)
+    calibration = fetch_calibration(api, filament_id, nozzle)
+    return exported, calibration, prepare_profile(exported, calibration, filament_keys)
+
+
+def held_back_keys(api, filament_id, changes, calibration):
+    """Return the edits that cannot be sent, and so are left out of the conflict check."""
+    # Calibration has to be set aside first: after a nozzle change it differs from the ancestor
+    # without being a conflict.
+    held_back = set(calibration) | FIELD_ONLY_KEYS
+    if "pressure_advance" in calibration:
+        held_back.add("enable_pressure_advance")
+    # Only an edited plate setting is worth asking Filament DB for the record.
+    if PLATE_ROW_KEYS & set(changes):
+        held_back |= plate_row_keys(api, filament_id)
+    held_back |= {key for key, value in changes.items() if key in SINGLE_VALUE_KEYS and len(value) > 1}
+    return held_back & set(changes)
+
+
+def recheck(api, filament_id, nozzle, filament_keys, changes, sendable, ancestor):
+    """Check Filament DB again once the user has agreed, and return its export and calibration.
+
+    The confirmation stays open for as long as the user likes, and a change made in Filament DB meanwhile
+    would otherwise be overwritten without a word. Filament DB has no conditional write, so a change that
+    lands between this read and the post can still be lost, but that window is a request long, not a
+    dialog long.
+    """
+    exported, calibration, theirs = fetch_theirs(api, filament_id, nozzle, filament_keys)
+    held_back = held_back_keys(api, filament_id, changes, calibration)
+    # An edit that is now held back, or no longer is, would change what the user agreed to send.
+    changed = [key for key in changes if (key in held_back) == (key in sendable)
+               or key in sendable and not same_value(theirs.get(key), ancestor.get(key))]
+    if changed:
+        raise SyncError(f"Nothing was sent, because these changed in Filament DB while you were deciding: "
+                        f"{key_list(changed)}. Run Pull from Filament DB to see its values, then send again.")
+    return exported, calibration
+
+
 def send(api):
     bundle = orca.host.preset_bundle()
     filaments = bundle.filaments
@@ -689,20 +729,8 @@ def send(api):
 
     nozzle = active_nozzle(bundle)
     filament_keys = set(edited.config_keys())
-    exported = fetch_export(api, filament_id)
-    calibration = fetch_calibration(api, filament_id, nozzle)
-    theirs = prepare_profile(exported, calibration, filament_keys)
-
-    # Calibration has to be set aside first: after a nozzle change it differs from the ancestor
-    # without being a conflict.
-    held_back = set(calibration) | FIELD_ONLY_KEYS
-    if "pressure_advance" in calibration:
-        held_back.add("enable_pressure_advance")
-    # Only an edited plate setting is worth asking Filament DB for the record.
-    if PLATE_ROW_KEYS & set(changes):
-        held_back |= plate_row_keys(api, filament_id)
-    held_back |= {key for key, value in changes.items() if key in SINGLE_VALUE_KEYS and len(value) > 1}
-    held_back &= set(changes)
+    exported, calibration, theirs = fetch_theirs(api, filament_id, nozzle, filament_keys)
+    held_back = held_back_keys(api, filament_id, changes, calibration)
     sendable = {key: value for key, value in changes.items() if key not in held_back}
 
     conflicts = [key for key in sendable if not same_value(theirs.get(key), ancestor.get(key))]
@@ -729,6 +757,7 @@ def send(api):
 
     if sendable:
         confirm_send(display_name(edited), sendable, theirs)
+        exported, calibration = recheck(api, filament_id, nozzle, filament_keys, changes, sendable, ancestor)
         api.request(f"/api/filaments/{bare_id(filament_id)}/orcaslicer", request_body(sendable, exported))
         theirs = prepare_profile(fetch_export(api, filament_id), calibration, filament_keys)
     install_bundle(bundle_dir, {**presets, stem: theirs})

@@ -775,6 +775,58 @@ class TestVerification:
         assert app.send().message == "Sent 1 of 1 edits to Filament DB."
 
 
+class TestListValues:
+    """OrcaSlicer writes a setting with a value per extruder variant as one line, in a form that depends
+    on the setting's type, so each value has to come back out on its own."""
+
+    @pytest.mark.parametrize("key, stored, edited, sent", [
+        ("filament_retraction_length", ["1", "2"], "nil,2", ["nil", "2"]),
+        ("filament_z_hop_types", ["Auto Lift", "Auto Lift"], "Normal Lift,nil", ["Normal Lift", "nil"]),
+        ("filament_end_gcode", ["M400"], 'M400;"M117 one";M401', ["M400", "M117 one", "M401"]),
+        ("filament_end_gcode", ["M400"], '"M117 one";M400', ["M117 one", "M400"]),
+        ("filament_end_gcode", ["M400"], '"G1 X1, Y2; wipe";M400', ["G1 X1, Y2; wipe", "M400"]),
+        ("filament_end_gcode", ["M400"], "G1,X1;M400", ["G1,X1", "M400"]),
+        ("filament_end_gcode", ["M400"], '"M117 \\"hi\\" C:\\\\x";"one\\ntwo"', ['M117 "hi" C:\\x', "one\ntwo"]),
+        ("filament_end_gcode", ["M400"], "M400;", ["M400", ""]),
+    ])
+    def test_each_variant_is_kept_in_filament_db_and_the_preset(self, app, key, stored, edited, sent):
+        app.db.filaments[PLAIN_ID]["settings"] = {key: stored}
+        edit(app, PLAIN, **{key: edited})
+        assert app.send().message == "Sent 1 of 1 edits to Filament DB."
+        assert app.db.posts == [{key: sent}]
+        assert app.db.filaments[PLAIN_ID]["settings"][key] == sent
+        assert bundle_preset(app, "Plain PLA")[key] == sent
+        assert app.filaments.selected.config_value(key) == edited
+
+    @pytest.mark.parametrize("key, edited, fused", [
+        ("filament_retraction_length", "nil,2", ["nil,2"]),
+        ("filament_end_gcode", 'M400;"M117 one";M401', ['M400;"M117 one";M401']),
+    ])
+    def test_values_run_together_in_filament_db_are_not_reported_as_kept(self, app, key, edited, fused):
+        edit(app, PLAIN, **{key: edited})
+        original = app.db.export
+
+        def export(filament_id):
+            # Only the read back after the post runs the values together.
+            return {**original(filament_id), key: fused} if app.db.posts else original(filament_id)
+
+        app.db.export = export
+        assert app.send().message == f"Sent 0 of 1 edits to Filament DB. Filament DB did not keep: {key}."
+
+    @pytest.mark.parametrize("edited", ['"unterminated', '"M117 one"M400', 'M400;M117 "one"'])
+    def test_a_value_that_cannot_be_read_sends_nothing(self, app, edited):
+        edit(app, PLAIN, filament_end_gcode=edited)
+        result = app.send()
+        assert result.message == "Nothing was sent, because OrcaSlicer's value for filament_end_gcode could not be read."
+        assert app.db.posts == []
+
+
+    def test_plugin_settings_on_the_preset_stay_local_and_do_not_stop_the_send(self, app):
+        edit(app, PLAIN, filament_plugin_config_overrides='[{"name":"x","enabled":true}]', filament_retraction_length="1.2")
+        assert app.send().message == "Sent 1 of 1 edits to Filament DB."
+        assert app.db.posts == [{"filament_retraction_length": ["1.2"]}]
+
+
 class TestErrors:
     def test_an_unreachable_server_is_explained(self, app):
         app.db.server.shutdown()
@@ -969,21 +1021,38 @@ class TestRedirects:
 
 
 class TestValues:
-    @pytest.mark.parametrize("value, expected", [
-        ("0.97", ["0.97"]),
-        ("0.97,0.98", ["0.97", "0.98"]),
-        ("95%", ["95%"]),
-        ("-.5", ["-.5"]),
-        ("#F7ADA6", ["#F7ADA6"]),
-        ("plain,text", ["plain,text"]),
-        ('"Bambu Lab"', ["Bambu Lab"]),
-        ('"one";"two"', ["one", "two"]),
-        ('"a\\nb\\t\\"c\\\\"', ['a\nb\t"c\\']),
-        ('"unterminated', []),
-        ("nil", ["nil"]),
+    @pytest.mark.parametrize("key, value, expected", [
+        ("filament_flow_ratio", "0.97", ["0.97"]),
+        ("filament_flow_ratio", "0.97,0.98", ["0.97", "0.98"]),
+        ("filament_shrink", "95%", ["95%"]),
+        ("filament_z_hop", "-.5", ["-.5"]),
+        ("filament_z_hop", "nil", ["nil"]),
+        ("filament_z_hop", "nil,0.4", ["nil", "0.4"]),
+        ("filament_z_hop_types", "Normal Lift,nil", ["Normal Lift", "nil"]),
+        ("default_filament_colour", "#F7ADA6", ["#F7ADA6"]),
+        ("filament_vendor", "plain,text", ["plain,text"]),
+        ("filament_vendor", "1,2", ["1,2"]),
+        ("filament_vendor", '"Bambu Lab"', ["Bambu Lab"]),
+        ("filament_vendor", '"one";"two"', ["one", "two"]),
+        ("filament_vendor", 'one;"two, three";four', ["one", "two, three", "four"]),
+        ("filament_vendor", '"";x', ["", "x"]),
+        ("filament_vendor", ";x", ["", "x"]),
+        ("filament_vendor", '""', [""]),
+        # OrcaSlicer only turns \\n and \\r back into other characters, and never writes \\t.
+        ("filament_notes", '"a\\nb\\r\\t\\"c\\\\"', ['a\nb\rt"c\\']),
+        # A setting missing from the plugin's list still reads as strings when only strings could hold this.
+        ("filament_mixed_components", 'a;"b c"', ["a", "b c"]),
+        # OrcaSlicer never writes a list of strings like these, so they are single strings.
+        ("filament_mixed_components", 'say "hi"', ['say "hi"']),
+        ("filament_mixed_components", '[{"name":"x"}];a\\nb', ['[{"name":"x"}];a\nb']),
+        ("filament_end_gcode", 'say "hi"', None),
     ])
-    def test_decode_value(self, plugin, value, expected):
-        assert plugin.decode_value(value) == expected
+    def test_decode_value(self, plugin, key, value, expected):
+        if expected is None:
+            with pytest.raises(plugin.SyncError):
+                plugin.decode_value(key, value)
+        else:
+            assert plugin.decode_value(key, value) == expected
 
     @pytest.mark.parametrize("first, second, same", [
         (["0.9"], ["0.90"], True),

@@ -154,7 +154,8 @@ class TestPull:
 
     @pytest.mark.parametrize("stored, plain", [('"250 100 42.4| 0.05 42.4"', "250 100 42.4| 0.05 42.4"), ('""', "")])
     def test_ini_quotes_from_a_prusaslicer_import_are_removed(self, app, stored, plain):
-        app.db.filaments[PLAIN_ID]["settings"] = {"filament_ramming_parameters": [stored]}
+        """Filament DB stores the text of a single INI value as a string, not as a list."""
+        app.db.filaments[PLAIN_ID]["settings"] = {"filament_ramming_parameters": stored}
         app.pull()
         assert bundle_preset(app, "Plain PLA")["filament_ramming_parameters"] == [plain]
 
@@ -1105,6 +1106,85 @@ class TestVerification:
         app.db.filaments[PLAIN_ID]["settings"] = {"filament_retraction_length": ["0.8"]}
         edit(app, PLAIN, filament_retraction_length="nil")
         assert app.send().message == "Sent 1 of 1 edits to Filament DB."
+
+
+class TestQuotes:
+    """Filament DB keeps a setting imported from PrusaSlicer as the text of its INI line, where quotes can
+    wrap the value. Its own fields and the lists OrcaSlicer sends hold the value itself, quotes and all."""
+
+    @pytest.mark.parametrize("settings", [{}, {"filament_vendor": '"Old"'}])
+    def test_a_field_keeps_its_quotes(self, app, settings):
+        """The field wins over INI text for the same setting in the settings bag."""
+        app.db.filaments[PLAIN_ID].update(vendor='"Maker"', settings=settings)
+        app.pull()
+        assert bundle_preset(app, "Plain PLA")["filament_vendor"] == ['"Maker"']
+
+    @pytest.mark.parametrize("stored", [['"M117 hi"'], ['"M117 hi"', "M400"]])
+    def test_a_list_from_orcaslicer_keeps_its_quotes(self, app, stored):
+        app.db.filaments[PLAIN_ID]["settings"] = {"filament_end_gcode": stored}
+        app.pull()
+        assert bundle_preset(app, "Plain PLA")["filament_end_gcode"] == stored
+
+    @pytest.mark.parametrize("stored, pulled", [
+        ('"say \\"hi\\" C:\\\\x"', ['say "hi" C:\\x']),
+        ("120 100", ["120 100"]),
+        # The export decodes a value that runs over several lines itself, and its quotes are then the text's.
+        ('"\\"a\\nb\\""', ['"a\nb"']),
+    ])
+    def test_a_prusaslicer_import_loses_the_quotes_of_its_ini_text(self, app, stored, pulled):
+        app.db.filaments[PLAIN_ID]["settings"] = {"filament_ramming_parameters": stored}
+        app.pull()
+        assert bundle_preset(app, "Plain PLA")["filament_ramming_parameters"] == pulled
+
+    def test_a_prusaslicer_name_is_translated_without_its_quotes(self, app):
+        app.db.filaments[PLAIN_ID]["settings"] = {"extrusion_multiplier": '"1.05"'}
+        app.pull()
+        assert bundle_preset(app, "Plain PLA")["filament_flow_ratio"] == ["1.05"]
+
+    def test_the_record_is_only_read_for_a_quoted_value(self, app):
+        app.pull()
+        assert app.db.record_reads == 0
+        app.db.filaments[PLAIN_ID]["vendor"] = '"Maker"'
+        app.pull()
+        assert app.db.record_reads == 1
+
+    def test_a_quoted_field_is_sent_and_kept(self, app):
+        edit(app, PLAIN, filament_vendor='"\\"Maker\\""')
+        assert app.send().message == "Sent 1 of 1 edits to Filament DB."
+        assert app.db.posts == [{"vendor": '"Maker"'}]
+        assert bundle_preset(app, "Plain PLA")["filament_vendor"] == ['"Maker"']
+
+    def test_a_quoted_list_value_is_sent_and_kept(self, app):
+        edit(app, PLAIN, filament_end_gcode='"\\"M117 hi\\""')
+        assert app.send().message == "Sent 1 of 1 edits to Filament DB."
+        assert app.db.posts == [{"filament_end_gcode": ['"M117 hi"']}]
+        assert bundle_preset(app, "Plain PLA")["filament_end_gcode"] == ['"M117 hi"']
+
+    def test_an_edit_over_a_prusaslicer_import_is_no_conflict(self, app):
+        app.db.filaments[PLAIN_ID]["settings"] = {"filament_ramming_parameters": '"120 100"'}
+        edit(app, PLAIN, filament_ramming_parameters='"130 100"')
+        assert app.send().message == "Sent 1 of 1 edits to Filament DB."
+        assert app.db.posts == [{"filament_ramming_parameters": ["130 100"]}]
+
+    def test_a_one_line_value_from_a_json_import_loses_its_quotes(self, app):
+        """Filament DB's OrcaSlicer and Bambu Studio .json import (unwrap in bambuStudioImport.ts) stores a
+        one-line value as a plain string, which its settings bag cannot tell apart from INI text."""
+        app.db.filaments[PLAIN_ID]["settings"] = {"filament_notes": '"Keep dry"'}
+        app.pull()
+        assert bundle_preset(app, "Plain PLA")["filament_notes"] == ["Keep dry"]
+
+    def test_the_readback_after_a_send_removes_ini_quotes(self, app):
+        app.db.filaments[PLAIN_ID]["settings"] = {"filament_ramming_parameters": '"120 100"'}
+        edit(app, PLAIN, filament_vendor='"Maker"')
+        assert app.send().message == "Sent 1 of 1 edits to Filament DB."
+        assert bundle_preset(app, "Plain PLA")["filament_ramming_parameters"] == ["120 100"]
+
+    def test_a_quoted_field_beside_a_prusaslicer_import_keeps_its_quotes(self, app):
+        app.db.filaments[PLAIN_ID]["vendor"] = '"Maker"'
+        app.db.filaments[PLAIN_ID]["settings"] = {"filament_notes": '"a note"'}
+        app.pull()
+        preset = bundle_preset(app, "Plain PLA")
+        assert (preset["filament_vendor"], preset["filament_notes"]) == (['"Maker"'], ["a note"])
 
 
 class TestListValues:

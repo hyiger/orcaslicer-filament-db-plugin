@@ -100,6 +100,23 @@ def serialized(key, value):
     return ";".join(items)
 
 
+def decode_multiline_wire_value(value):
+    """decodeMultilineWireValue in Filament DB's src/lib/parseIni.ts. A settings string is INI text, and the
+    export decodes one only when it is a single quoted value with plain escapes that runs over several lines."""
+    quoted = re.fullmatch(r'"((?:[^"\\]|\\.)*)"', value, re.DOTALL)
+    if not quoted or not re.fullmatch(r'(?:[^\\]|\\[\\"nr])*', quoted[1], re.DOTALL):
+        return value
+    decoded = re.sub(r"\\(.)", lambda escape: {"n": "\n", "r": "\r"}.get(escape[1], escape[1]), quoted[1],
+                     flags=re.DOTALL)
+    return decoded if re.search(r"[\r\n]", decoded) else value
+
+
+def exported_setting(value):
+    """filamentToOrcaSlicerKeys in Filament DB's src/lib/orcaSlicerBundle.ts: a list from OrcaSlicer is
+    exported as it is stored, and a string, which a PrusaSlicer import leaves, as INI text."""
+    return [str(item) for item in value] if isinstance(value, list) else [decode_multiline_wire_value(value)]
+
+
 class FakePreset:
     def __init__(self, name, file="", values=None, is_dirty=False):
         self.name = name
@@ -217,7 +234,7 @@ class FakeFilamentDb:
 
     def export(self, filament_id):
         record = self.resolved(filament_id)
-        keys = {key: list(value) for key, value in record.get("settings", {}).items()}
+        keys = {key: exported_setting(value) for key, value in record.get("settings", {}).items()}
         temperatures = record.get("temperatures", {})
         if "notes" in record and "filament_notes" not in keys:
             keys["filament_notes"] = [record["notes"]]

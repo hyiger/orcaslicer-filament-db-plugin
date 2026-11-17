@@ -424,6 +424,25 @@ def unquoted(value):
     return [unescaped(quoted[1]) if (quoted := QUOTED_STRING.fullmatch(item)) else item for item in value]
 
 
+def ini_keys(api, profile):
+    """Return the settings whose exported value is the text of a PrusaSlicer INI line, quotes and all.
+
+    Filament DB keeps such a setting as a string in its settings bag, and its own fields and the lists sent
+    from OrcaSlicer as the value itself, where a quote is part of the value. The export makes a list of
+    every one of them, so only the record tells them apart, and it is only read when a value is quoted.
+    Its OrcaSlicer and Bambu Studio .json import also stores a one-line value as a string, and the bag
+    does not say where a string came from, so Filament DB treats every string as INI text and so does this.
+    """
+    quoted = [key for key, value in profile.items()
+              if isinstance(value, list) and len(value) == 1 and QUOTED_STRING.fullmatch(value[0])]
+    if not quoted:
+        return set()
+    settings = api.request(f"/api/filaments/{bare_id(profile['filament_id'])}").get("settings") or {}
+    # The export decodes INI text that runs over several lines itself, and a field wins over the
+    # settings bag, so only a value exported just as the string is stored is still INI text.
+    return {key for key in quoted if isinstance(settings.get(key), str) and profile[key] == [settings[key]]}
+
+
 def orca_z_shrinkage(value):
     """Convert Filament DB's shrinkage, 0.2 for 0.2%, to Orca's remaining size of 99.8%.
 
@@ -434,15 +453,16 @@ def orca_z_shrinkage(value):
     return [f"{round(number if number >= 50 else 100 - number, 4):g}%" for number in numbers]
 
 
-def prepare_profile(profile, calibration, filament_keys):
+def prepare_profile(profile, calibration, filament_keys, ini):
     """Turn an exported profile into a preset that a live reload accepts.
 
     A reload refuses the whole bundle over one invalid preset, and a preset is invalid if it holds a
     known setting that does not belong in a filament preset. Filament DB's settings bag can hold
     anything, such as PrusaSlicer keys, so only the keys of a filament preset are kept. The same goes
     for "nil", which means not overridden, is refused by many settings, and is what leaving one out does.
+    The settings in *ini* are PrusaSlicer INI text, and lose its quoting.
     """
-    settings = dict(profile)
+    settings = {key: unquoted(value) if key in ini else value for key, value in profile.items()}
     if "filament_colour" in settings:
         settings["default_filament_colour"] = settings.pop("filament_colour")
     for prusaslicer_key, orca_key in PRUSASLICER_KEYS.items():
@@ -462,17 +482,18 @@ def prepare_profile(profile, calibration, filament_keys):
             if "hot_plate_temp" + suffix in settings:
                 settings.setdefault(plate + suffix, settings["hot_plate_temp" + suffix])
     if settings.get(Z_SHRINKAGE_KEY) not in (None, ["nil"]):
-        settings[Z_SHRINKAGE_KEY] = orca_z_shrinkage(unquoted(settings[Z_SHRINKAGE_KEY]))
+        settings[Z_SHRINKAGE_KEY] = orca_z_shrinkage(settings[Z_SHRINKAGE_KEY])
 
     prepared = {key: profile[key] for key in METADATA_KEYS if key in profile}
     prepared["version"] = PRESET_VERSION
-    prepared.update({key: unquoted(value) for key, value in settings.items()
+    prepared.update({key: value for key, value in settings.items()
                      if key in filament_keys - SCOPE_KEYS and value != ["nil"]})
     return prepared
 
 
 def fetch_profiles(api, nozzle, filament_keys):
-    return [prepare_profile(profile, fetch_calibration(api, profile["filament_id"], nozzle), filament_keys)
+    return [prepare_profile(profile, fetch_calibration(api, profile["filament_id"], nozzle), filament_keys,
+                            ini_keys(api, profile))
             for profile in api.request("/api/filaments/orcaslicer")]
 
 
@@ -669,7 +690,7 @@ def fetch_theirs(api, filament_id, nozzle, filament_keys):
     """Return Filament DB's export of the filament, its calibration for the nozzle, and the preset they make."""
     exported = fetch_export(api, filament_id)
     calibration = fetch_calibration(api, filament_id, nozzle)
-    return exported, calibration, prepare_profile(exported, calibration, filament_keys)
+    return exported, calibration, prepare_profile(exported, calibration, filament_keys, ini_keys(api, exported))
 
 
 def held_back_keys(api, filament_id, changes, calibration):
@@ -715,7 +736,8 @@ def load_back(api, filament_id, calibration, filament_keys, bundle_dir, presets,
     edit to one of them reads as a change made in Filament DB until a pull catches the bundle up.
     """
     try:
-        theirs = prepare_profile(fetch_export(api, filament_id), calibration, filament_keys)
+        exported = fetch_export(api, filament_id)
+        theirs = prepare_profile(exported, calibration, filament_keys, ini_keys(api, exported))
         install_bundle(bundle_dir, {**presets, stem: theirs})
     except Exception as error:
         raise SyncError(f"These edits were saved in Filament DB, but OrcaSlicer could not load them back: "

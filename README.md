@@ -8,7 +8,7 @@ Keeps OrcaSlicer's filament presets in step with [Filament DB](https://github.co
 2. Run **Pull from Filament DB**. Your filaments appear in the filament dropdown.
 3. Change a setting in OrcaSlicer and run **Send to Filament DB**. Do not press Save.
 
-**Pull from Filament DB** replaces the synced presets with what Filament DB holds, including the calibration for the nozzle on the active printer. Run it again after you change something in Filament DB or switch to another nozzle size. Unsent edits in OrcaSlicer are kept.
+**Pull from Filament DB** replaces the synced presets with what Filament DB holds, including the calibration for the nozzle on the active printer. Run it again after you change something in Filament DB or switch to another nozzle size, or between a standard and a high-flow nozzle. Unsent edits in OrcaSlicer are kept.
 
 **Send to Filament DB** shows your unsaved changes to the selected filament, old value and new, and sends them once you press OK. It then pulls that filament back. It sends only those settings, so a variant keeps inheriting everything else from its parent.
 
@@ -37,6 +37,7 @@ These are in the Config tab of **Pull from Filament DB**.
 - **Settings Filament DB does not hold use OrcaSlicer's defaults,** not the ones of the material's generic preset. A filament imported from PrusaSlicer or Bambu Studio is the most complete. This includes a max volumetric speed of 0, which means no limit in PrusaSlicer and which OrcaSlicer does not accept.
 - **Every bed type gets the filament's bed temperature,** unless Filament DB has one for that bed type.
 - **The calibration comes from the first nozzle of the active printer.** A toolchanger with mixed nozzle sizes gets the first tool's values.
+- **A standard and a high-flow nozzle of the same size get their own calibration,** going by the printer's nozzle volume type. Every high-flow type counts as high flow, as Filament DB has one high-flow flag. A high-flow nozzle never gets a filament's standard calibration, or the reverse: a filament calibrated for only one kind has no calibration on the other. A volume type of Hybrid, which mixes both kinds on one extruder, stops Pull and Send, because it does not say which calibration applies. This needs a printer profile that lets you choose a high-flow volume type. On one that offers only Standard, such as Prusa's HF nozzle profiles, the volume type says nothing about the nozzle, so it gets whichever of the two Filament DB gives first.
 - **Syncing is by command.** Nothing happens until you run one, and a change made in Filament DB does not appear by itself.
 - **Filaments deleted in OrcaSlicer are not deleted in Filament DB,** and a new filament made in OrcaSlicer cannot be sent. Create it in Filament DB. Neither can a saved copy of a filament that was removed from Filament DB.
 - **Filament DB's template filaments are not pulled,** because its export leaves them out.
@@ -90,6 +91,7 @@ The unit tests cannot reach the steps below, which need the running app. Use a c
 - [ ] Edit a setting and send. The confirmation shows the old and new values. After OK, Filament DB has the new value, and the preset no longer shows as edited.
 - [ ] Edit a setting, send and press Cancel. Filament DB is unchanged, and the edit stays.
 - [ ] Edit a calibrated value and send. It is held back, and the calibration in Filament DB is unchanged.
+- [ ] On a printer whose nozzle size has a standard and a high-flow calibration in Filament DB, pull, switch the nozzle volume type and pull again. Each pull gets that nozzle's calibration.
 - [ ] Change a value in Filament DB, edit it in OrcaSlicer and send. Nothing is sent. Pull and send again.
 - [ ] Edit a variant and send. Its parent is unchanged.
 - [ ] Save a preset under a new name and send it. Nothing is sent. Change a setting on the copy and send. Only that setting reaches the filament it came from.

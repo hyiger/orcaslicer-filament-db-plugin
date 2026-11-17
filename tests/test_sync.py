@@ -1444,6 +1444,114 @@ class TestCalibration:
         assert app.send().message == "Sent 1 of 1 edits to Filament DB."
 
 
+class TestStandardAndHighFlowNozzles:
+    """One printer with a standard and a high-flow 0.4 mm nozzle, each with its own calibration."""
+
+    STANDARD = {"printer": "Bambu Labs H2D", "highFlow": False, "keys": {"filament_flow_ratio": ["0.95"]}}
+    HIGH_FLOW = {"printer": "Bambu Labs H2D", "highFlow": True, "keys": {"pressure_advance": ["0.02"]}}
+
+    @pytest.fixture(autouse=True)
+    def two_nozzles(self, app):
+        app.config["printer"] = "Bambu Labs H2D"
+        # As OrcaSlicer serializes the H2D's list: each extruder's variants, quoted for their commas.
+        app.state.variants = ('"Direct Drive Standard,Direct Drive High Flow";'
+                              '"Direct Drive Standard,Direct Drive High Flow,Direct Drive TPU High Flow"')
+        app.db.calibrations[(PLAIN_ID, "0.4")] = [self.STANDARD, self.HIGH_FLOW]
+
+    @pytest.mark.parametrize("high_flow_first", [False, True])
+    def test_a_standard_nozzle_gets_the_standard_row(self, app, high_flow_first):
+        if high_flow_first:
+            app.db.calibrations[(PLAIN_ID, "0.4")].reverse()
+        app.pull()
+        preset = bundle_preset(app, "Plain PLA")
+        assert preset["filament_flow_ratio"] == ["0.95"]
+        assert "pressure_advance" not in preset
+
+    @pytest.mark.parametrize("volume_type", ["High Flow", "TPU High Flow", "E3D High Flow", "Extra High Flow"])
+    def test_switching_to_a_high_flow_nozzle_gets_the_high_flow_row(self, app, volume_type):
+        app.pull()
+        app.state.volume_type = volume_type
+        assert app.pull().message.endswith("for a 0.4 mm high-flow nozzle.")
+        preset = bundle_preset(app, "Plain PLA")
+        assert preset["pressure_advance"] == ["0.02"]
+        assert "filament_flow_ratio" not in preset
+
+    def test_the_first_extruder_decides(self, app):
+        app.state.volume_type = "High Flow,Standard"
+        app.pull()
+        assert bundle_preset(app, "Plain PLA")["pressure_advance"] == ["0.02"]
+
+    def test_a_high_flow_nozzle_never_gets_a_standard_only_calibration(self, app):
+        app.state.volume_type = "High Flow"
+        app.pull()
+        preset = bundle_preset(app, "Calibrated PLA")
+        assert "filament_flow_ratio" not in preset
+        assert "pressure_advance" not in preset
+
+    def test_send_holds_back_the_standard_rows_settings_on_a_standard_nozzle(self, app):
+        edit(app, PLAIN, filament_flow_ratio="0.9")
+        assert "cannot be sent: filament_flow_ratio" in app.send().message
+        assert not app.db.posts
+
+    def test_send_holds_back_the_high_flow_rows_settings_on_a_high_flow_nozzle(self, app):
+        app.state.volume_type = "High Flow"
+        edit(app, PLAIN, filament_flow_ratio="0.9", pressure_advance="0.03")
+        message = app.send().message
+        assert message == ("Sent 1 of 2 edits to Filament DB. Change these in Filament DB, as they cannot be "
+                           "sent: pressure_advance.")
+        assert app.db.posts == [{"filament_flow_ratio": ["0.9"]}]
+
+    def test_a_standard_nozzle_never_gets_a_high_flow_only_calibration(self, app):
+        app.db.calibrations[(PLAIN_ID, "0.4")] = [self.HIGH_FLOW]
+        app.pull()
+        assert "pressure_advance" not in bundle_preset(app, "Plain PLA")
+
+    def test_a_standard_nozzle_gets_a_row_whose_nozzle_has_no_high_flow_flag(self, app):
+        """Filament DB counts a nozzle saved without the flag as standard, but high_flow=0 does not match it."""
+        app.db.calibrations[(PLAIN_ID, "0.4")] = [{"printer": "Bambu Labs H2D", "keys": {"pressure_advance": ["0.05"]}}]
+        app.pull()
+        assert bundle_preset(app, "Plain PLA")["pressure_advance"] == ["0.05"]
+        edit(app, PLAIN, pressure_advance="0.06")
+        assert "cannot be sent: pressure_advance" in app.send().message
+        assert not app.db.posts
+
+    @pytest.mark.parametrize("variants", ["Direct Drive Standard", "Bowden Standard",
+                                          'Direct Drive Standard;"Direct Drive Standard,Direct Drive High Flow"',
+                                          None, '"unclosed'])
+    def test_a_printer_that_offers_no_high_flow_variant_gets_either_row(self, app, variants):
+        """Prusa's HF nozzle profiles list no high-flow variant, so their volume type stays Standard."""
+        app.state.variants = variants
+        app.db.calibrations[(PLAIN_ID, "0.4")] = [self.HIGH_FLOW]
+        assert app.pull().message.endswith("for a 0.4 mm nozzle.")
+        assert bundle_preset(app, "Plain PLA")["pressure_advance"] == ["0.02"]
+        edit(app, PLAIN, pressure_advance="0.03")
+        assert "cannot be sent: pressure_advance" in app.send().message
+        assert not app.db.posts
+
+    def test_a_high_flow_volume_type_counts_without_a_high_flow_variant(self, app):
+        app.state.variants = "Direct Drive Standard"
+        app.state.volume_type = "High Flow"
+        app.pull()
+        assert bundle_preset(app, "Plain PLA")["pressure_advance"] == ["0.02"]
+
+    @pytest.mark.parametrize("volume_type", ["Hybrid", None, "", "Something New"])
+    def test_a_nozzle_that_is_not_clearly_one_or_the_other_stops_the_pull(self, app, volume_type):
+        app.state.volume_type = volume_type
+        result = app.pull()
+        assert result.status is PluginResult.Skipped
+        assert result.message == (f"The printer's nozzle volume type is {volume_type or ''!r}, so it is not "
+                                  "clear whether its standard or its high-flow calibration applies. Nothing "
+                                  "was changed. Set the volume type to Standard or to a high-flow type, then "
+                                  "run this again.")
+        assert not (app.bundle_dir / "filament").exists()
+
+    def test_a_hybrid_nozzle_stops_a_send(self, app):
+        edit(app, PLAIN, nozzle_temperature="225")
+        app.state.volume_type = "Hybrid"
+        assert "Nothing was changed" in app.send().message
+        assert not app.db.posts
+
+
 class TestVerification:
     def test_reports_a_value_filament_db_did_not_keep(self, app):
         """Filament DB's export overrides its settings bag with structured fields such as shrinkage."""

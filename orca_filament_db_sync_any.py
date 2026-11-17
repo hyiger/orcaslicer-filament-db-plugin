@@ -128,6 +128,10 @@ PLATE_ROWS = {
 PLATE_ROW_KEYS = frozenset(key for keys in PLATE_ROWS.values() for key in keys)
 # These fields hold one value, and a filament with several extruder variants has one per variant.
 SINGLE_VALUE_KEYS = STRUCTURED_FIELDS.keys() | TEMPERATURE_FIELDS.keys()
+# OrcaSlicer's nozzle volume types, as Filament DB's one high-flow flag sees them. Hybrid is an extruder
+# holding nozzles of both kinds, so it does not say which calibration a filament prints with.
+HIGH_FLOW_VOLUME_TYPES = {"Standard": False, "High Flow": True, "TPU High Flow": True, "E3D High Flow": True,
+                          "Extra High Flow": True}
 MAX_LISTED_CHANGES = 15
 MAX_SHOWN_VALUE_LENGTH = 40
 # The lists of strings in a filament preset, from OrcaSlicer's PrintConfig.cpp. The host hands values over
@@ -484,13 +488,40 @@ def read_pulled(bundle_dir):
 
 
 def active_nozzle(bundle):
+    """Return the first extruder's nozzle diameter, and whether that nozzle is a high-flow one."""
     value = bundle.full_config_value("nozzle_diameter") or ""
     nozzle = re.split("[,;]", value)[0].strip()
     try:
         float(nozzle)
     except ValueError:
         raise SyncError(f"Could not read the printer's nozzle diameter from {value!r}.") from None
-    return nozzle
+    return nozzle, high_flow(bundle)
+
+
+def high_flow(bundle):
+    """Return whether the first extruder's nozzle is a high-flow one, or None if the printer cannot say.
+
+    A filament can have a standard and a high-flow row for the same diameter on the same printer, and
+    without saying which, Filament DB answers with either.
+    """
+    volume_type = (bundle.full_config_value("nozzle_volume_type") or "").split(",")[0].strip()
+    if volume_type not in HIGH_FLOW_VOLUME_TYPES:
+        raise SyncError(f"The printer's nozzle volume type is {volume_type!r}, so it is not clear whether its "
+                        "standard or its high-flow calibration applies. Nothing was changed. Set the volume "
+                        "type to Standard or to a high-flow type, then run this again.")
+    if HIGH_FLOW_VOLUME_TYPES[volume_type] or offers_high_flow(bundle):
+        return HIGH_FLOW_VOLUME_TYPES[volume_type]
+    # Profiles such as Prusa's HF nozzles do not list a high-flow variant, so OrcaSlicer leaves their volume
+    # type at Standard and offers no other. Standard says nothing about such a nozzle.
+    return None
+
+
+def offers_high_flow(bundle):
+    """Return whether OrcaSlicer lets the first extruder's volume type be set to a high-flow one."""
+    value = bundle.full_config_value("extruder_variant_list") or ""
+    # Each extruder has one value, its variants such as "Direct Drive High Flow" with commas between them.
+    variants = (string_list(value) or [""])[0].split(",")
+    return any(variant.strip().endswith(" High Flow") for variant in variants)
 
 
 def bare_id(filament_id):
@@ -503,10 +534,11 @@ def fetch_calibration(api, filament_id, nozzle):
     The route falls back to any row for the nozzle, and a machine's retraction, temperatures and
     chamber settings do not carry over to another one.
     """
-    path = f"/api/filaments/{bare_id(filament_id)}/calibration?nozzle_diameter={nozzle}&format=orcaslicer"
+    diameter, is_high_flow = nozzle
+    path = f"/api/filaments/{bare_id(filament_id)}/calibration?nozzle_diameter={diameter}&format=orcaslicer"
     if api.printer:
         path += "&printer=" + urllib.parse.quote(api.printer)
-    result = api.request(path, missing_ok=True)
+    result = request_calibration(api, path, is_high_flow)
     if not result:
         return {}
     printer = result.get("printer")
@@ -514,6 +546,21 @@ def fetch_calibration(api, filament_id, nozzle):
         return result.get("calibration_orca", {})
     api.other_printers.add(printer)
     return {}
+
+
+def request_calibration(api, path, is_high_flow):
+    """Return the route's answer for the kind of nozzle, or None if it has no row for it."""
+    if is_high_flow is None:
+        return api.request(path, missing_ok=True)
+    result = api.request(f"{path}&high_flow={int(is_high_flow)}", missing_ok=True)
+    if result or is_high_flow:
+        return result
+    # A nozzle saved without a high-flow flag matches neither high_flow=0 nor 1, though Filament DB
+    # counts it as standard. Ask again without the flag, and keep only a row that is not high flow.
+    result = api.request(path, missing_ok=True)
+    if result and (result.get("nozzle") or {}).get("highFlow") is True:
+        return None
+    return result
 
 
 def unescaped(text):
@@ -764,7 +811,9 @@ def pull(api):
     replaced = sorted(in_use - presets.keys())
     install_bundle(bundle_dir, presets)
 
-    message = f"Pulled {len(profiles)} filaments from Filament DB for a {nozzle} mm nozzle."
+    diameter, is_high_flow = nozzle
+    kind = "high-flow nozzle" if is_high_flow else "nozzle"
+    message = f"Pulled {len(profiles)} filaments from Filament DB for a {diameter} mm {kind}."
     if replaced:
         message += f" These were removed, so OrcaSlicer chose other presets for them: {key_list(replaced)}."
     if api.other_printers:

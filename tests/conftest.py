@@ -310,6 +310,11 @@ class FakeFilamentDb:
                 match = re.fullmatch(r"/api/filaments/([^/]+)/calibration", url.path)
                 if match:
                     rows = db.calibrations.get((match[1], query["nozzle_diameter"][0]), [])
+                    # high_flow filters, where the printer only prioritizes. It compares the nozzle's flag
+                    # as stored, so a nozzle saved without one matches neither high_flow=0 nor 1.
+                    if "high_flow" in query:
+                        wanted = query["high_flow"] == ["1"]
+                        rows = [row for row in rows if "highFlow" in row and row["highFlow"] == wanted]
                     wanted = query.get("printer", [""])[0].strip().casefold()
                     # The real route only prioritizes a printer, and falls back to any row for the nozzle.
                     row = next((row for row in rows if (row.get("printer") or "").casefold() == wanted),
@@ -319,7 +324,10 @@ class FakeFilamentDb:
                     elif query.get("format") != ["orcaslicer"]:
                         self.reply(200, {"calibration": {}})
                     else:
-                        self.reply(200, {"printer": row.get("printer"), "calibration_orca": row["keys"]})
+                        # JSON leaves out a flag the nozzle does not have.
+                        nozzle = {"highFlow": row["highFlow"]} if "highFlow" in row else {}
+                        self.reply(200, {"nozzle": nozzle, "printer": row.get("printer"),
+                                         "calibration_orca": row["keys"]})
                 else:
                     ids = query["ids"][0].split(",") if "ids" in query else sorted(db.filaments)
                     self.reply(200, [db.export(filament_id) for filament_id in ids if filament_id in db.filaments])
@@ -431,8 +439,12 @@ def app(orca, plugin, db):
     filaments = FakeFilaments()
     bundles = FakeBundles(plugin.data_dir_for_test, filaments, "cloud-user")
     # slots names the presets of the other filament slots, which OrcaSlicer restores by name on a reload.
-    state = SimpleNamespace(nozzle="0.4", slots=[])
-    bundle = SimpleNamespace(filaments=filaments, full_config_value=lambda key: state.nozzle,
+    # volume_type is the printer's nozzle_volume_type, a project setting the full config carries, and
+    # variants its extruder_variant_list, which by default offers only a standard nozzle.
+    state = SimpleNamespace(nozzle="0.4", volume_type="Standard", variants="Direct Drive Standard", slots=[])
+    config = {"nozzle_diameter": lambda: state.nozzle, "nozzle_volume_type": lambda: state.volume_type,
+              "extruder_variant_list": lambda: state.variants}
+    bundle = SimpleNamespace(filaments=filaments, full_config_value=lambda key: config[key](),
                              current_filament_preset_names=lambda: [filaments.selected.name, *state.slots])
     orca.host.preset_bundle = lambda: bundle
     orca.host.preset.bundles = bundles

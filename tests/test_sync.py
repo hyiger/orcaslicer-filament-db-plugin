@@ -11,6 +11,8 @@ from conftest import (BUNDLE_ID, CALIBRATED_ID, MOVED_PREFIX, PLAIN_ID, PLATE_RO
 
 PLAIN = f"_local/{BUNDLE_ID}/Plain PLA"
 CALIBRATED = f"_local/{BUNDLE_ID}/Calibrated PLA"
+REMOVED_TEXT = ("Filament DB at {} does not have this filament. If that is the right address, discard the edits "
+                "to it, then run Pull from Filament DB to remove its synced preset.")
 
 
 def bundle_preset(app, name):
@@ -154,7 +156,8 @@ class TestPull:
 
     @pytest.mark.parametrize("stored, plain", [('"250 100 42.4| 0.05 42.4"', "250 100 42.4| 0.05 42.4"), ('""', "")])
     def test_ini_quotes_from_a_prusaslicer_import_are_removed(self, app, stored, plain):
-        app.db.filaments[PLAIN_ID]["settings"] = {"filament_ramming_parameters": [stored]}
+        """Filament DB stores the text of a single INI value as a string, not as a list."""
+        app.db.filaments[PLAIN_ID]["settings"] = {"filament_ramming_parameters": stored}
         app.pull()
         assert bundle_preset(app, "Plain PLA")["filament_ramming_parameters"] == [plain]
 
@@ -176,18 +179,6 @@ class TestPull:
         app.config["printer"] = "Prusa Core One INDX"
         app.pull()
         assert bundle_preset(app, "Calibrated PLA")["filament_flow_ratio"] == ["0.97"]
-
-    def test_an_empty_export_leaves_the_presets_alone(self, app):
-        app.pull()
-        app.db.filaments.clear()
-        result = app.pull()
-        assert result.status is PluginResult.Skipped
-        assert "has no filaments" in result.message
-        assert PLAIN in app.filaments.presets
-
-    def test_an_empty_export_is_fine_on_a_first_pull(self, app):
-        app.db.filaments.clear()
-        assert app.pull().message.startswith("Pulled 0 filaments")
 
     def test_reports_a_removed_filament_that_was_in_use(self, app):
         app.pull()
@@ -231,6 +222,48 @@ class TestPull:
         app.db.filaments[CALIBRATED_ID]["name"] = "a:b"
         app.pull()
         assert sorted(path.stem for path in (app.bundle_dir / "filament").glob("*.json")) == ["A-B", "a-b (2)"]
+
+    @pytest.mark.parametrize("name, stem", [
+        ("NUL", "NUL_"),
+        ("con.PLA", "con_.PLA"),
+        ("Com1 . ", "Com1_"),
+        ("LPT9 .old", "LPT9_ .old"),
+        ("aux", "aux_"),
+        ("COM²", "COM²_"),
+        ("CONIN$", "CONIN$_"),
+        ("NULL", "NULL"),
+        ("COM10", "COM10"),
+        ("COM1 PLA", "COM1 PLA"),
+        ("Console.PLA", "Console.PLA"),
+    ])
+    def test_a_windows_device_name_is_not_used_as_a_file_name(self, app, name, stem):
+        """Windows opens the device for such a name, even with an extension after it."""
+        app.db.filaments[PLAIN_ID]["name"] = name
+        app.pull()
+        assert (app.bundle_dir / "filament" / f"{stem}.json").exists()
+
+    def test_a_device_name_pulled_before_is_moved_once(self, app):
+        """Earlier versions wrote "AUX" as it is, which works outside Windows. The next pull moves it to "AUX_",
+        and OrcaSlicer chooses another preset for a slot that had the old one."""
+        app.db.filaments[PLAIN_ID]["name"] = "AUX"
+        app.pull()
+        filament_dir = app.bundle_dir / "filament"
+        (filament_dir / "AUX_.json").rename(filament_dir / "AUX.json")
+        app.bundles.reload_local(BUNDLE_ID)
+        app.filaments.select(f"_local/{BUNDLE_ID}/AUX")
+        assert "chose other presets for them: AUX." in app.pull().message
+        assert preset_stems(app) == ["AUX_", "Calibrated PLA"]
+
+    def test_unsent_edits_on_a_device_name_pulled_before_are_kept(self, app):
+        app.db.filaments[PLAIN_ID]["name"] = "AUX"
+        app.pull()
+        filament_dir = app.bundle_dir / "filament"
+        (filament_dir / "AUX_.json").rename(filament_dir / "AUX.json")
+        app.bundles.reload_local(BUNDLE_ID)
+        app.filaments.select(f"_local/{BUNDLE_ID}/AUX", {"filament_vendor": "Maker"})
+        assert app.pull().message == ('"AUX" has unsent edits, and this pull gives its preset a new name. '
+                                      "Send or discard them, then pull again. Nothing was changed.")
+        assert (filament_dir / "AUX.json").exists()
 
     def test_finds_the_active_users_folder_and_leaves_no_trace_in_others(self, app, plugin):
         app.pull()
@@ -290,7 +323,8 @@ class TestPull:
             app.db.filaments[PLAIN_ID]["name"] = "Renamed PLA"
         else:
             del app.db.filaments[PLAIN_ID]
-        assert f'"Plain PLA" has unsent edits, and it was {"renamed in" if change == "rename" else "removed from"}' in app.pull().message
+        moved = "this pull gives its preset a new name" if change == "rename" else "it was removed from Filament DB"
+        assert f'"Plain PLA" has unsent edits, and {moved}.' in app.pull().message
         assert bundle_preset(app, "Plain PLA") == before
 
     def test_unsent_edits_never_reach_a_filament_that_took_the_name(self, app):
@@ -305,8 +339,8 @@ class TestPull:
     def test_adding_a_filament_does_not_move_an_existing_preset(self, app, plugin):
         first = {"name": "A:B", "filament_id": "fdb_1"}
         added = {"name": "A/B", "filament_id": "fdb_2"}  # sorts first by name, but it came later
-        assert plugin.preset_files([first]) == {"A-B": first}
-        assert plugin.preset_files([added, first]) == {"A-B": first, "A-B (2)": added}
+        assert plugin.preset_files([first], app.bundle_dir, {}, set()) == {"A-B": first}
+        assert plugin.preset_files([added, first], app.bundle_dir, {}, set()) == {"A-B": first, "A-B (2)": added}
 
     def test_a_refused_reload_puts_the_old_files_back(self, app):
         """The files are the conflict check's ancestor, so they must match what OrcaSlicer loaded."""
@@ -382,6 +416,306 @@ class TestPull:
         app.pull()
         active[0] = False
         assert not seen
+
+
+def preset_stems(app):
+    return sorted(path.stem for path in (app.bundle_dir / "filament").glob("*.json"))
+
+
+class TestAnEmptyFilamentDb:
+    """An empty export can mean the last filament was deleted, or that the plugin points at the wrong copy."""
+
+    def emptied(self, app):
+        app.pull()
+        app.db.filaments.clear()
+        app.orca.host.ui.dialogs.clear()
+
+    def test_asks_before_removing_the_presets(self, app):
+        self.emptied(app)
+        app.pull()
+        assert app.orca.host.ui.dialogs == [
+            f"Filament DB at {app.db.url} has no filaments. Remove all 2 synced presets from OrcaSlicer?\n\n"
+            "Press Cancel if the plugin is pointing at the wrong copy of Filament DB."]
+
+    def test_cancel_leaves_the_presets_alone(self, app):
+        self.emptied(app)
+        app.orca.host.ui.answer = "cancel"
+        result = app.pull()
+        assert result.status is PluginResult.Skipped
+        assert result.message == "Filament DB has no filaments, and the synced presets were left alone."
+        assert PLAIN in app.filaments.presets
+        assert preset_stems(app) == ["Calibrated PLA", "Plain PLA"]
+        assert app.bundles.reloads == 1
+
+    def test_ok_removes_the_presets(self, app):
+        self.emptied(app)
+        result = app.pull()
+        assert result.status is PluginResult.Success
+        assert result.message == "Pulled 0 filaments from Filament DB for a 0.4 mm nozzle."
+        assert preset_stems(app) == []
+        assert not {PLAIN, CALIBRATED} & set(app.filaments.presets)
+
+    def test_names_a_single_preset_as_one(self, app):
+        app.pull()
+        del app.db.filaments[PLAIN_ID]
+        app.pull()
+        app.db.filaments.clear()
+        app.orca.host.ui.answer = "cancel"
+        app.pull()
+        assert "Remove the 1 synced preset from OrcaSlicer?" in app.orca.host.ui.dialogs[-1]
+
+    def test_a_first_pull_asks_nothing(self, app):
+        app.db.filaments.clear()
+        assert app.pull().message.startswith("Pulled 0 filaments")
+        assert not app.orca.host.ui.dialogs
+
+    def test_counts_and_removes_a_file_it_cannot_read(self, app):
+        self.emptied(app)
+        (app.bundle_dir / "filament" / "Plain PLA.json").write_text("{", encoding="utf-8")
+        app.pull()
+        assert "Remove all 2 synced presets" in app.orca.host.ui.dialogs[0]
+        assert preset_stems(app) == []
+
+    def test_unsent_edits_still_stop_the_removal_once_confirmed(self, app):
+        """The question comes first, so that edits are not discarded over a pull from the wrong copy."""
+        self.emptied(app)
+        app.filaments.select(PLAIN, {"nozzle_temperature": "222"})
+        result = app.pull()
+        assert len(app.orca.host.ui.dialogs) == 1
+        assert result.message == ('"Plain PLA" has unsent edits, and it was removed from Filament DB. '
+                                  "Discard them, then pull again. Nothing was changed.")
+        assert preset_stems(app) == ["Calibrated PLA", "Plain PLA"]
+        app.filaments.select(PLAIN)
+        app.pull()
+        assert preset_stems(app) == []
+
+    def test_cancel_with_unsent_edits_keeps_them(self, app):
+        self.emptied(app)
+        app.filaments.select(PLAIN, {"nozzle_temperature": "222"})
+        app.orca.host.ui.answer = "cancel"
+        assert app.pull().message == "Filament DB has no filaments, and the synced presets were left alone."
+        assert app.filaments.edited.config_value("nozzle_temperature") == "222"
+
+
+class TestLongNames:
+    """A file name holds at most 255 bytes on common file systems, and the preset is written to its
+    name plus .tmp first. Windows counts UTF-16 units instead, of which a name never has more than bytes."""
+
+    @staticmethod
+    def assert_fits(app):
+        for path in (app.bundle_dir / "filament").glob("*.json"):
+            assert len((path.name + ".tmp").encode("utf-8")) <= 255
+
+    # The leading x puts the cut in the middle of a character.
+    @pytest.mark.parametrize("name", ["P" * 256, "xé" + "é" * 200, "x" + "日本" * 50])
+    def test_a_long_name_does_not_stop_the_pull(self, app, name):
+        app.pull()
+        app.db.filaments[PLAIN_ID]["name"] = name
+        app.db.filaments[CALIBRATED_ID]["temperatures"]["nozzle"] = 235
+        assert app.pull().status is PluginResult.Success
+        assert app.filaments.presets[CALIBRATED].config_value("nozzle_temperature") == "235"
+        self.assert_fits(app)
+        [stem] = [stem for stem in preset_stems(app) if stem != "Calibrated PLA"]
+        # The cut keeps whole characters, and marks the name as cut short.
+        assert name.startswith(stem.rpartition("… ")[0])
+        assert len(stem.encode("utf-8")) > 200
+
+    def test_a_name_that_fits_is_kept_whole(self, app):
+        name = "é" * 123  # 246 bytes, and 255 with .json.tmp
+        app.db.filaments[PLAIN_ID]["name"] = name
+        app.pull()
+        assert name in preset_stems(app)
+
+    def test_long_names_sharing_a_start_stay_apart_and_keep_their_file_names(self, app):
+        app.db.filaments[PLAIN_ID]["name"] = "P" * 300 + " red"
+        app.db.filaments[CALIBRATED_ID]["name"] = "P" * 300 + " blue"
+        app.pull()
+        stems = preset_stems(app)
+        assert len(stems) == 2 and not any(stem.endswith(")") for stem in stems)
+        app.pull()
+        assert preset_stems(app) == stems
+        self.assert_fits(app)
+
+    def test_the_same_long_name_twice_is_numbered_and_still_fits(self, app):
+        app.db.filaments[PLAIN_ID]["name"] = app.db.filaments[CALIBRATED_ID]["name"] = "P" * 300
+        app.pull()
+        first, second = preset_stems(app)
+        assert second.endswith(" (2)") and second.removesuffix(" (2)").endswith(first[-10:])
+        self.assert_fits(app)
+
+    # The emoji are 4 bytes and 2 UTF-16 units each, so this name fits in 255 bytes but not in the room left.
+    @pytest.mark.parametrize("name", ["P" * 200, "x" + "😀" * 60])
+    def test_on_windows_the_folder_takes_room_from_the_file_name(self, app, monkeypatch, name):
+        """OrcaSlicer is not marked as long path aware, so Windows holds it to 259 units in a whole path."""
+        filament_dir = app.bundle_dir / "filament"
+        monkeypatch.setattr(app.plugin, "MAX_PATH_UNITS", len(str(filament_dir)) + 1 + 100)
+        app.db.filaments[PLAIN_ID]["name"] = name
+        assert app.pull().status is PluginResult.Success
+        for path in filament_dir.glob("*.json"):
+            assert len(str(path).encode("utf-16-le")) // 2 + len(".tmp") <= app.plugin.MAX_PATH_UNITS
+        [stem] = [stem for stem in preset_stems(app) if stem != "Calibrated PLA"]
+        assert name.startswith(stem.rpartition("… ")[0]) and len(stem.encode("utf-16-le")) // 2 > 80
+
+    def test_on_windows_a_file_name_that_no_longer_fits_the_folder_is_cut_again(self, app, monkeypatch):
+        filament_dir = app.bundle_dir / "filament"
+        monkeypatch.setattr(app.plugin, "MAX_PATH_UNITS", len(str(filament_dir)) + 1 + 300)  # room for 255
+        app.db.filaments[PLAIN_ID]["name"] = "P" * 300
+        app.pull()
+        [before] = [stem for stem in preset_stems(app) if stem != "Calibrated PLA"]
+        monkeypatch.setattr(app.plugin, "MAX_PATH_UNITS", len(str(filament_dir)) + 1 + 100)
+        assert app.pull().status is PluginResult.Success
+        [after] = [stem for stem in preset_stems(app) if stem != "Calibrated PLA"]
+        assert after != before
+        for path in filament_dir.glob("*.json"):
+            assert len(str(path).encode("utf-16-le")) // 2 + len(".tmp") <= app.plugin.MAX_PATH_UNITS
+
+    def test_a_long_name_can_be_edited_and_sent(self, app):
+        app.db.filaments[PLAIN_ID]["name"] = "P" * 300
+        app.pull()
+        [stem] = [stem for stem in preset_stems(app) if stem != "Calibrated PLA"]
+        edit(app, f"_local/{BUNDLE_ID}/{stem}", filament_vendor="Maker")
+        assert app.send().message == "Sent 1 of 1 edits to Filament DB."
+        assert app.db.posts == [{"vendor": "Maker"}]
+
+
+NEW_ID = "c" * 24
+FIRST_ID = "0" * 24  # sorts before every other id
+
+
+def bundle_ids(app):
+    return {stem: bundle_preset(app, stem)["filament_id"].removeprefix("fdb_") for stem in preset_stems(app)}
+
+
+def put_in_slot(app, slot, stem):
+    """Put the synced preset *stem* in the selected filament slot, or in one of the others."""
+    name = f"_local/{BUNDLE_ID}/{stem}"
+    if slot == "selected":
+        app.filaments.select(name)
+    else:
+        app.state.slots.append(name)
+
+
+def add_filament(app, filament_id, name):
+    app.db.filaments[filament_id] = {"name": name, "type": "PLA", "vendor": "Spike", "temperatures": {"nozzle": 250}}
+
+
+class TestAFileNameStaysWithItsFilament:
+    """OrcaSlicer restores the preset of every filament slot by name, and a preset's name is its file name.
+    A file name handed to another filament would quietly put that filament in the slot."""
+
+    @pytest.fixture(params=["selected", "secondary"])
+    def slot(self, request):
+        return request.param
+
+    @pytest.fixture
+    def alike(self, app):
+        app.db.filaments[PLAIN_ID]["name"] = "A/B"
+        app.db.filaments[CALIBRATED_ID]["name"] = "A:B"
+        app.pull()
+        assert bundle_ids(app) == {"A-B": PLAIN_ID, "A-B (2)": CALIBRATED_ID}
+
+    def test_deleting_the_first_of_two_names_alike_does_not_move_the_second(self, app, alike, slot):
+        put_in_slot(app, slot, "A-B")
+        del app.db.filaments[PLAIN_ID]
+        assert "chose other presets for them: A-B." in app.pull().message
+        assert bundle_ids(app) == {"A-B (2)": CALIBRATED_ID}
+        assert f"_local/{BUNDLE_ID}/A-B" not in app.filaments.presets
+
+    def test_a_new_filament_does_not_take_a_file_name_a_slot_holds(self, app, alike, slot):
+        put_in_slot(app, slot, "A-B")
+        del app.db.filaments[PLAIN_ID]
+        add_filament(app, NEW_ID, "A/B")
+        assert "chose other presets for them: A-B." in app.pull().message
+        assert bundle_ids(app) == {"A-B (2)": CALIBRATED_ID, "A-B (3)": NEW_ID}
+
+    def test_a_new_filament_keeps_the_file_name_it_got_once_the_slot_moves_on(self, app, alike, slot):
+        put_in_slot(app, slot, "A-B")
+        del app.db.filaments[PLAIN_ID]
+        add_filament(app, NEW_ID, "A/B")
+        app.pull()
+        app.state.slots.clear()
+        app.filaments.select(f"_local/{BUNDLE_ID}/A-B (2)")
+        app.pull()
+        assert bundle_ids(app) == {"A-B (2)": CALIBRATED_ID, "A-B (3)": NEW_ID}
+
+    def test_a_file_name_no_slot_holds_can_go_to_a_new_filament(self, app, alike):
+        del app.db.filaments[PLAIN_ID]
+        add_filament(app, NEW_ID, "A/B")
+        assert "chose other presets" not in app.pull().message
+        assert bundle_ids(app) == {"A-B": NEW_ID, "A-B (2)": CALIBRATED_ID}
+
+    def test_a_new_filament_that_sorts_first_does_not_take_an_existing_file_name(self, app, slot):
+        app.db.filaments[PLAIN_ID]["name"] = "A:B"
+        app.pull()
+        put_in_slot(app, slot, "A-B")
+        add_filament(app, FIRST_ID, "A/B")
+        assert app.pull().message == "Pulled 3 filaments from Filament DB for a 0.4 mm nozzle."
+        assert bundle_ids(app) == {"A-B": PLAIN_ID, "A-B (2)": FIRST_ID, "Calibrated PLA": CALIBRATED_ID}
+
+    def test_a_new_filament_does_not_take_the_file_name_of_a_renamed_one_in_a_slot(self, app, slot):
+        app.pull()
+        put_in_slot(app, slot, "Plain PLA")
+        app.db.filaments[PLAIN_ID]["name"] = "Old PLA"
+        add_filament(app, NEW_ID, "Plain PLA")
+        assert "chose other presets for them: Plain PLA." in app.pull().message
+        assert bundle_ids(app) == {"Calibrated PLA": CALIBRATED_ID, "Old PLA": PLAIN_ID, "Plain PLA (2)": NEW_ID}
+
+    def test_a_filament_in_a_slot_can_take_its_own_name_in_other_capitals(self, app, slot):
+        app.pull()
+        put_in_slot(app, slot, "Plain PLA")
+        app.db.filaments[PLAIN_ID]["name"] = "PLAIN PLA"
+        app.pull()
+        assert bundle_ids(app) == {"Calibrated PLA": CALIBRATED_ID, "PLAIN PLA": PLAIN_ID}
+
+    def test_a_renamed_filament_leaves_its_number_behind(self, app, alike):
+        app.db.filaments[CALIBRATED_ID]["name"] = "C:D"
+        app.pull()
+        assert bundle_ids(app) == {"A-B": PLAIN_ID, "C-D": CALIBRATED_ID}
+
+    def test_a_filament_whose_own_name_loses_its_number_loses_it_from_the_file_name(self, app):
+        app.db.filaments[PLAIN_ID]["name"] = "PLA (2)"
+        app.pull()
+        app.db.filaments[PLAIN_ID]["name"] = "PLA"
+        app.pull()
+        assert bundle_ids(app) == {"Calibrated PLA": CALIBRATED_ID, "PLA": PLAIN_ID}
+
+    def test_a_filament_whose_own_name_has_a_number_keeps_it(self, app):
+        app.db.filaments[PLAIN_ID]["name"] = "PLA (2)"
+        app.pull()
+        app.pull()
+        assert bundle_ids(app) == {"Calibrated PLA": CALIBRATED_ID, "PLA (2)": PLAIN_ID}
+
+    # A half-saved hand edit, a file that is not a preset, and a preset that lost its name.
+    @pytest.mark.parametrize("content", ["{", "[]", f'{{"filament_id": "fdb_{PLAIN_ID}"}}'])
+    def test_a_pull_repairs_a_file_it_cannot_read(self, app, content):
+        app.pull()
+        (app.bundle_dir / "filament" / "Plain PLA.json").write_text(content, encoding="utf-8")
+        assert app.pull().message == "Pulled 2 filaments from Filament DB for a 0.4 mm nozzle."
+        assert bundle_ids(app) == {"Calibrated PLA": CALIBRATED_ID, "Plain PLA": PLAIN_ID}
+
+    def test_a_file_it_cannot_read_still_asks_when_filament_db_is_empty(self, app):
+        app.pull()
+        (app.bundle_dir / "filament" / "Plain PLA.json").write_text("{", encoding="utf-8")
+        (app.bundle_dir / "filament" / "Calibrated PLA.json").unlink()
+        app.db.filaments.clear()
+        app.orca.host.ui.answer = "cancel"
+        assert "Filament DB has no filaments" in app.pull().message
+        assert preset_stems(app) == ["Plain PLA"]
+
+    def test_a_numbered_long_name_keeps_its_file_name(self, app):
+        app.db.filaments[PLAIN_ID]["name"] = app.db.filaments[CALIBRATED_ID]["name"] = "P" * 300
+        app.pull()
+        numbered = next(stem for stem, filament_id in bundle_ids(app).items() if filament_id == CALIBRATED_ID)
+        assert numbered.endswith(" (2)")
+        del app.db.filaments[PLAIN_ID]
+        app.pull()
+        assert bundle_ids(app) == {numbered: CALIBRATED_ID}
+
+    def test_an_edit_to_a_filament_that_kept_its_number_is_sent_to_it(self, app, alike):
+        del app.db.filaments[PLAIN_ID]
+        edit(app, f"_local/{BUNDLE_ID}/A-B (2)", filament_vendor="Maker")
+        assert app.send().message == "Sent 1 of 1 edits to Filament DB."
+        assert app.db.filaments[CALIBRATED_ID]["vendor"] == "Maker"
 
 
 class TestSend:
@@ -488,6 +822,7 @@ class TestSend:
 
     def test_a_filament_that_was_never_pulled_is_refused(self, app, plugin):
         app.pull()
+        app.db.filaments["c" * 24] = {**app.db.filaments[PLAIN_ID], "name": "New PLA"}
         path = plugin.data_dir_for_test / "user" / "Copy.json"
         path.write_text(json.dumps({"filament_id": "fdb_" + "c" * 24}))
         app.filaments.edited = FakePreset("Copy", path)
@@ -496,7 +831,19 @@ class TestSend:
     def test_a_filament_deleted_in_filament_db_is_reported(self, app):
         edit(app, PLAIN, nozzle_temperature="222")
         del app.db.filaments[PLAIN_ID]
-        assert "no longer has this filament" in app.send().message
+        assert app.send().message == REMOVED_TEXT.format(app.db.url)
+
+    @pytest.mark.parametrize("emptied", [False, True])
+    def test_the_advice_for_a_deleted_filament_removes_its_preset(self, app, emptied):
+        """Pull refuses a preset with unsent edits, and asks first when Filament DB has nothing left."""
+        edit(app, PLAIN, nozzle_temperature="222")
+        app.db.filaments.pop(PLAIN_ID)
+        if emptied:
+            app.db.filaments.clear()
+        app.send()
+        app.filaments.select(PLAIN)
+        assert app.pull().status is PluginResult.Success
+        assert "Plain PLA" not in preset_stems(app)
 
     def saved_copy(self, app, plugin, **differences):
         """A preset saved under a new name, which keeps the filament's id and nothing else in common."""
@@ -518,6 +865,19 @@ class TestSend:
         app.filaments.select("Edited Plain PLA", {"filament_density": "1.35"})
         assert app.send().message == "Sent 1 of 1 edits to Filament DB."
         assert app.db.posts == [{"density": "1.35"}]
+
+    def test_a_saved_copy_of_a_removed_filament_is_not_sent_back_to_pull(self, app, plugin):
+        """Following the advice to discard and pull removes the synced preset, and pulling again cannot help."""
+        app.pull()
+        self.saved_copy(app, plugin)
+        app.filaments.select("Edited Plain PLA", {"filament_density": "1.35"})
+        del app.db.filaments[PLAIN_ID]
+        assert app.send().message == REMOVED_TEXT.format(app.db.url)
+        assert app.pull().message.startswith("Pulled 1 filaments")
+        app.filaments.select("Edited Plain PLA", {"filament_density": "1.35"})
+        assert app.send().message == (f'"Edited Plain PLA" came from a filament that Filament DB at {app.db.url} '
+                                      "does not have, so there is nowhere to send it.")
+        assert not app.db.posts
 
     def test_a_synced_preset_is_judged_by_its_file_not_its_loaded_value(self, app):
         """OrcaSlicer's form of a value can differ from the file's, and only a copy needs this check."""
@@ -764,13 +1124,182 @@ class TestPlateRows:
         assert app.send().message == "Sent 1 of 1 edits to Filament DB."
 
     def test_the_record_is_only_read_for_a_plate_temperature(self, app):
-        edit(app, PLAIN, nozzle_temperature="222", supertack_plate_temp="55")
+        # Calibrated PLA has no bed temperature, so making its preset does not need the record either.
+        edit(app, CALIBRATED, nozzle_temperature="222", supertack_plate_temp="55")
+        app.db.record_reads = 0
         app.send()
         assert app.db.record_reads == 0
-        edit(app, PLAIN, textured_cool_plate_temp_initial_layer="65")
+        edit(app, CALIBRATED, textured_cool_plate_temp_initial_layer="65")
+        app.db.record_reads = 0
         assert app.send().message == "Sent 1 of 1 edits to Filament DB."
         # Once to ask, and once more after the confirmation in case a row was added meanwhile.
         assert app.db.record_reads == 2
+
+
+class TestBedSpecificValues:
+    """A preset has a temperature per plate, so a value Filament DB holds for one bed type stays on its plate."""
+
+    OTHER_PLATES = ("cool", "eng", "supertack", "textured_cool", "textured")
+    HOT_PLATE_CALIBRATION = {"bedType": "Hot Plate", "keys": {"hot_plate_temp": ["88"], "nozzle_temperature": ["250"]}}
+    LEFT_OUT_TEXT = "Calibration tied to one bed type was left out, other than any bed temperature for its plate: "
+    NO_PLATE_TEXT = "Calibration for a bed type OrcaSlicer has no plate for was left out: "
+
+    def test_a_hot_plate_row_stays_on_the_hot_plate(self, app):
+        """The issue as reported: a Hot Plate row of 75 reached the Textured PEI Plate."""
+        app.db.filaments[PLAIN_ID]["bedTypeTemps"] = [{"bedType": "Hot Plate", "temperature": 75}]
+        app.pull()
+        preset = bundle_preset(app, "Plain PLA")
+        assert (preset["hot_plate_temp"], preset["hot_plate_temp_initial_layer"]) == (["75"], ["75"])
+        for plate in self.OTHER_PLATES:
+            assert preset[f"{plate}_plate_temp"] == ["60"]
+            assert preset[f"{plate}_plate_temp_initial_layer"] == ["60"]
+
+    def test_a_hot_plate_row_for_the_first_layer_stays_on_the_hot_plate(self, app):
+        app.db.filaments[PLAIN_ID]["temperatures"]["bedFirstLayer"] = 62
+        app.db.filaments[PLAIN_ID]["bedTypeTemps"] = [{"bedType": "Hot Plate", "firstLayerTemperature": 70}]
+        app.pull()
+        preset = bundle_preset(app, "Plain PLA")
+        assert preset["hot_plate_temp_initial_layer"] == ["70"]
+        assert preset["textured_plate_temp_initial_layer"] == ["62"]
+
+    @pytest.mark.parametrize("stored", [["58"], "58", '"58"'])
+    def test_a_bed_temperature_in_the_settings_bag_reaches_the_other_plates(self, app, stored):
+        del app.db.filaments[PLAIN_ID]["temperatures"]["bed"]
+        app.db.filaments[PLAIN_ID]["settings"] = {"hot_plate_temp": stored}
+        app.db.filaments[PLAIN_ID]["bedTypeTemps"] = [{"bedType": "Hot Plate", "temperature": 75}]
+        app.pull()
+        assert bundle_preset(app, "Plain PLA")["textured_plate_temp"] == ["58"]
+
+    def test_a_hot_plate_row_without_a_bed_temperature_leaves_the_other_plates_alone(self, app):
+        del app.db.filaments[PLAIN_ID]["temperatures"]["bed"]
+        app.db.filaments[PLAIN_ID]["bedTypeTemps"] = [{"bedType": "Hot Plate", "temperature": 75}]
+        app.pull()
+        preset = bundle_preset(app, "Plain PLA")
+        assert preset["hot_plate_temp"] == ["75"]
+        assert "textured_plate_temp" not in preset
+
+    def test_another_plates_row_still_leaves_the_hot_plate_temperature_to_the_rest(self, app):
+        app.db.filaments[PLAIN_ID]["bedTypeTemps"] = [{"bedType": "Textured PEI Plate", "temperature": 70}]
+        app.pull()
+        preset = bundle_preset(app, "Plain PLA")
+        assert preset["textured_plate_temp"] == ["70"]
+        assert preset["cool_plate_temp"] == ["60"]
+
+    def test_a_calibration_for_every_bed_type_reaches_the_plates_beside_a_hot_plate_row(self, app):
+        app.db.filaments[PLAIN_ID]["bedTypeTemps"] = [{"bedType": "Hot Plate", "temperature": 75}]
+        app.db.calibrations[(PLAIN_ID, "0.4")] = [{"keys": {"hot_plate_temp": ["80"]}}]
+        app.pull()
+        preset = bundle_preset(app, "Plain PLA")
+        assert (preset["hot_plate_temp"], preset["textured_plate_temp"]) == (["80"], ["80"])
+
+    def test_the_record_is_not_read_when_every_plate_has_its_own_temperature(self, app):
+        app.db.filaments[PLAIN_ID]["settings"] = {
+            f"{plate}_plate_temp{suffix}": ["55"] for plate in self.OTHER_PLATES for suffix in ("", "_initial_layer")}
+        app.pull()
+        assert app.db.record_reads == 0
+
+    def test_the_record_is_read_once_for_both_quotes_and_plates(self, app):
+        app.db.filaments[PLAIN_ID]["vendor"] = '"Maker"'
+        app.pull()
+        assert app.db.record_reads == 1
+
+    def test_a_hot_plate_calibration_stays_on_the_hot_plate(self, app):
+        """The issue as reported: its 88 reached the Textured PEI Plate, and its 250 every plate."""
+        app.db.calibrations[(PLAIN_ID, "0.4")] = [self.HOT_PLATE_CALIBRATION]
+        message = app.pull().message
+        preset = bundle_preset(app, "Plain PLA")
+        assert preset["hot_plate_temp"] == ["88"]
+        assert preset["textured_plate_temp"] == ["60"]
+        assert preset["nozzle_temperature"] == ["215"]
+        assert message.endswith(self.LEFT_OUT_TEXT + "Hot Plate.")
+
+    def test_a_calibration_for_another_plate_moves_to_that_plate(self, app):
+        app.db.calibrations[(PLAIN_ID, "0.4")] = [{"bedType": "Textured PEI Plate", "keys": {
+            "hot_plate_temp": ["88"], "hot_plate_temp_initial_layer": ["90"], "pressure_advance": ["0.05"]}}]
+        app.pull()
+        preset = bundle_preset(app, "Plain PLA")
+        assert (preset["textured_plate_temp"], preset["textured_plate_temp_initial_layer"]) == (["88"], ["90"])
+        assert (preset["hot_plate_temp"], preset["cool_plate_temp_initial_layer"]) == (["60"], ["60"])
+        assert "pressure_advance" not in preset
+
+    def test_a_calibration_wins_over_its_plates_row(self, app):
+        app.db.filaments[PLAIN_ID]["bedTypeTemps"] = [{"bedType": "Textured PEI Plate", "temperature": 70}]
+        app.db.calibrations[(PLAIN_ID, "0.4")] = [{"bedType": "Textured PEI Plate", "keys": {"hot_plate_temp": ["88"]}}]
+        assert app.pull().message == "Pulled 2 filaments from Filament DB for a 0.4 mm nozzle."
+        assert bundle_preset(app, "Plain PLA")["textured_plate_temp"] == ["88"]
+
+    def test_a_calibration_for_a_bed_type_orcaslicer_has_no_plate_for_is_left_out(self, app):
+        app.db.calibrations[(PLAIN_ID, "0.4")] = [{"bedType": "Smooth PEI", "keys": {
+            "hot_plate_temp": ["88"], "pressure_advance": ["0.05"]}}]
+        message = app.pull().message
+        assert message.endswith(" 0.4 mm nozzle. " + self.NO_PLATE_TEXT + "Smooth PEI.")
+        preset = bundle_preset(app, "Plain PLA")
+        assert preset["hot_plate_temp"] == ["60"]
+        assert "pressure_advance" not in preset
+
+    def test_a_calibration_with_only_bed_temperatures_is_not_reported(self, app):
+        app.db.calibrations[(PLAIN_ID, "0.4")] = [{"bedType": "Hot Plate", "keys": {"hot_plate_temp": ["88"]}}]
+        assert app.pull().message == "Pulled 2 filaments from Filament DB for a 0.4 mm nozzle."
+
+    def test_a_calibrated_plate_without_a_first_layer_value_uses_its_bed_temperature(self, app):
+        """The Hot Plate's first layer followed its calibrated 88, and the Textured PEI Plate's stayed at 60."""
+        for bed_type, plate in (("Hot Plate", "hot"), ("Textured PEI Plate", "textured")):
+            app.db.calibrations[(PLAIN_ID, "0.4")] = [{"bedType": bed_type, "keys": {"hot_plate_temp": ["88"]}}]
+            app.pull()
+            preset = bundle_preset(app, "Plain PLA")
+            assert (preset[f"{plate}_plate_temp"], preset[f"{plate}_plate_temp_initial_layer"]) == (["88"], ["88"])
+
+    def test_a_calibrated_plate_keeps_the_filaments_own_first_layer_temperature(self, app):
+        app.db.filaments[PLAIN_ID]["temperatures"]["bedFirstLayer"] = 62
+        for bed_type, plate in (("Hot Plate", "hot"), ("Textured PEI Plate", "textured")):
+            app.db.calibrations[(PLAIN_ID, "0.4")] = [{"bedType": bed_type, "keys": {"hot_plate_temp": ["88"]}}]
+            app.pull()
+            assert bundle_preset(app, "Plain PLA")[f"{plate}_plate_temp_initial_layer"] == ["62"]
+
+    def test_each_plate_gets_its_own_calibration(self, app):
+        app.db.calibrations[(PLAIN_ID, "0.4")] = [
+            {"bedType": "Smooth PEI", "keys": {"hot_plate_temp": ["99"]}},
+            {"bedType": "Hot Plate", "keys": {"hot_plate_temp": ["88"]}},
+            {"bedType": "Textured PEI Plate", "keys": {"hot_plate_temp": ["70"], "nozzle_temperature": ["250"]}}]
+        message = app.pull().message
+        preset = bundle_preset(app, "Plain PLA")
+        assert (preset["hot_plate_temp"], preset["textured_plate_temp"], preset["cool_plate_temp"]) == (
+            ["88"], ["70"], ["60"])
+        assert message.endswith(f"{self.LEFT_OUT_TEXT}Textured PEI Plate. {self.NO_PLATE_TEXT}Smooth PEI.")
+
+    def test_a_plates_calibration_for_another_printer_is_left_out(self, app):
+        app.db.calibrations[(PLAIN_ID, "0.4")] = [
+            {"bedType": "Hot Plate", "keys": {"hot_plate_temp": ["88"]}},
+            {"bedType": "Textured PEI Plate", "printer": "MK4", "keys": {"hot_plate_temp": ["70"]}}]
+        message = app.pull().message
+        assert bundle_preset(app, "Plain PLA")["textured_plate_temp"] == ["60"]
+        assert message.endswith("Calibration tied to other printers was left out: MK4.")
+
+    def test_a_plates_calibration_for_any_printer_is_found_behind_another_printers(self, app):
+        """With no printer set, Filament DB answers with another printer's row for every bed type first."""
+        app.db.calibrations[(PLAIN_ID, "0.4")] = [
+            {"bedType": "Textured PEI Plate", "keys": {"hot_plate_temp": ["65"]}},
+            {"printer": "Core One", "keys": {"filament_flow_ratio": ["0.8"]}}]
+        message = app.pull().message
+        preset = bundle_preset(app, "Plain PLA")
+        assert (preset["textured_plate_temp"], preset["hot_plate_temp"]) == (["65"], ["60"])
+        assert preset.get("filament_flow_ratio") != ["0.8"]
+        assert message.endswith("Calibration tied to other printers was left out: Core One.")
+        edit(app, PLAIN, textured_plate_temp="70")
+        assert "cannot be sent: textured_plate_temp" in app.send().message
+        assert not app.db.posts
+
+    def test_a_calibration_for_every_bed_type_comes_first(self, app):
+        app.db.calibrations[(PLAIN_ID, "0.4")] = [self.HOT_PLATE_CALIBRATION, {"keys": {"nozzle_temperature": ["230"]}}]
+        assert app.pull().message == "Pulled 2 filaments from Filament DB for a 0.4 mm nozzle."
+        assert bundle_preset(app, "Plain PLA")["nozzle_temperature"] == ["230"]
+
+    def test_send_holds_back_only_what_a_bed_type_calibration_sets(self, app):
+        app.db.calibrations[(PLAIN_ID, "0.4")] = [self.HOT_PLATE_CALIBRATION]
+        edit(app, PLAIN, nozzle_temperature="222", hot_plate_temp="90")
+        assert app.send().message == ("Sent 1 of 2 edits to Filament DB. Change these in Filament DB, as they "
+                                      "cannot be sent: hot_plate_temp.")
+        assert app.db.posts == [{"temperatures": {"nozzle": "222"}}]
 
 
 class TestConflicts:
@@ -900,8 +1429,7 @@ class TestChangesWhileConfirming:
     def test_a_filament_deleted_while_confirming_is_reported(self, app):
         edit(app, PLAIN, nozzle_temperature="222")
         app.orca.host.ui.while_open = lambda: app.db.filaments.pop(PLAIN_ID)
-        assert app.send().message == ("Filament DB no longer has this filament. "
-                                      "Run Pull from Filament DB to remove it.")
+        assert app.send().message == REMOVED_TEXT.format(app.db.url)
         assert not app.db.posts
 
 
@@ -1087,6 +1615,108 @@ class TestCalibration:
         assert app.send().message == "Sent 1 of 1 edits to Filament DB."
 
 
+class TestStandardAndHighFlowNozzles:
+    """One printer with a standard and a high-flow 0.4 mm nozzle, each with its own calibration."""
+
+    STANDARD = {"printer": "Bambu Labs H2D", "highFlow": False, "keys": {"filament_flow_ratio": ["0.95"]}}
+    HIGH_FLOW = {"printer": "Bambu Labs H2D", "highFlow": True, "keys": {"pressure_advance": ["0.02"]}}
+
+    @pytest.fixture(autouse=True)
+    def two_nozzles(self, app):
+        app.config["printer"] = "Bambu Labs H2D"
+        # As OrcaSlicer serializes the H2D's list: each extruder's variants, quoted for their commas.
+        app.state.variants = ('"Direct Drive Standard,Direct Drive High Flow";'
+                              '"Direct Drive Standard,Direct Drive High Flow,Direct Drive TPU High Flow"')
+        app.db.calibrations[(PLAIN_ID, "0.4")] = [self.STANDARD, self.HIGH_FLOW]
+
+    @pytest.mark.parametrize("high_flow_first", [False, True])
+    def test_a_standard_nozzle_gets_the_standard_row(self, app, high_flow_first):
+        if high_flow_first:
+            app.db.calibrations[(PLAIN_ID, "0.4")].reverse()
+        app.pull()
+        preset = bundle_preset(app, "Plain PLA")
+        assert preset["filament_flow_ratio"] == ["0.95"]
+        assert "pressure_advance" not in preset
+
+    @pytest.mark.parametrize("volume_type", ["High Flow", "TPU High Flow", "E3D High Flow", "Extra High Flow"])
+    def test_switching_to_a_high_flow_nozzle_gets_the_high_flow_row(self, app, volume_type):
+        app.pull()
+        app.state.volume_type = volume_type
+        assert app.pull().message.endswith("for a 0.4 mm high-flow nozzle.")
+        preset = bundle_preset(app, "Plain PLA")
+        assert preset["pressure_advance"] == ["0.02"]
+        assert "filament_flow_ratio" not in preset
+
+    def test_the_first_extruder_decides(self, app):
+        app.state.volume_type = "High Flow,Standard"
+        app.pull()
+        assert bundle_preset(app, "Plain PLA")["pressure_advance"] == ["0.02"]
+
+    def test_a_high_flow_nozzle_never_gets_a_standard_only_calibration(self, app):
+        app.state.volume_type = "High Flow"
+        app.pull()
+        preset = bundle_preset(app, "Calibrated PLA")
+        assert "filament_flow_ratio" not in preset
+        assert "pressure_advance" not in preset
+
+    def test_send_holds_back_the_standard_rows_settings_on_a_standard_nozzle(self, app):
+        edit(app, PLAIN, filament_flow_ratio="0.9")
+        assert "cannot be sent: filament_flow_ratio" in app.send().message
+        assert not app.db.posts
+
+    def test_send_holds_back_the_high_flow_rows_settings_on_a_high_flow_nozzle(self, app):
+        app.state.volume_type = "High Flow"
+        edit(app, PLAIN, filament_flow_ratio="0.9", pressure_advance="0.03")
+        message = app.send().message
+        assert message == ("Sent 1 of 2 edits to Filament DB. Change these in Filament DB, as they cannot be "
+                           "sent: pressure_advance.")
+        assert app.db.posts == [{"filament_flow_ratio": ["0.9"]}]
+
+    def test_a_standard_nozzle_never_gets_a_high_flow_only_calibration(self, app):
+        app.db.calibrations[(PLAIN_ID, "0.4")] = [self.HIGH_FLOW]
+        app.pull()
+        assert "pressure_advance" not in bundle_preset(app, "Plain PLA")
+
+    def test_a_standard_nozzle_gets_a_row_whose_nozzle_has_no_high_flow_flag(self, app):
+        """Filament DB counts a nozzle saved without the flag as standard, but high_flow=0 does not match it."""
+        app.db.calibrations[(PLAIN_ID, "0.4")] = [{"printer": "Bambu Labs H2D", "keys": {"pressure_advance": ["0.05"]}}]
+        app.pull()
+        assert bundle_preset(app, "Plain PLA")["pressure_advance"] == ["0.05"]
+        edit(app, PLAIN, pressure_advance="0.06")
+        assert "cannot be sent: pressure_advance" in app.send().message
+        assert not app.db.posts
+
+    @pytest.mark.parametrize("variants", ["Direct Drive Standard", "Bowden Standard",
+                                          'Direct Drive Standard;"Direct Drive Standard,Direct Drive High Flow"',
+                                          None, '"unclosed'])
+    def test_a_printer_that_offers_no_high_flow_variant_gets_either_row(self, app, variants):
+        """Prusa's HF nozzle profiles list no high-flow variant, so their volume type stays Standard."""
+        app.state.variants = variants
+        app.db.calibrations[(PLAIN_ID, "0.4")] = [self.HIGH_FLOW]
+        assert app.pull().message.endswith("for a 0.4 mm nozzle.")
+        assert bundle_preset(app, "Plain PLA")["pressure_advance"] == ["0.02"]
+        edit(app, PLAIN, pressure_advance="0.03")
+        assert "cannot be sent: pressure_advance" in app.send().message
+        assert not app.db.posts
+
+    def test_a_high_flow_volume_type_counts_without_a_high_flow_variant(self, app):
+        app.state.variants = "Direct Drive Standard"
+        app.state.volume_type = "High Flow"
+        app.pull()
+        assert bundle_preset(app, "Plain PLA")["pressure_advance"] == ["0.02"]
+
+    @pytest.mark.parametrize("volume_type", ["Hybrid", None, "", "Something New"])
+    def test_a_nozzle_that_is_not_clearly_one_or_the_other_gets_either_row(self, app, volume_type):
+        """Hybrid holds nozzles of both kinds, so like an unknown type it does not narrow the calibration."""
+        app.state.volume_type = volume_type
+        app.db.calibrations[(PLAIN_ID, "0.4")] = [self.HIGH_FLOW]
+        assert app.pull().message.endswith("for a 0.4 mm nozzle.")
+        assert bundle_preset(app, "Plain PLA")["pressure_advance"] == ["0.02"]
+        edit(app, PLAIN, pressure_advance="0.03")
+        assert "cannot be sent: pressure_advance" in app.send().message
+        assert not app.db.posts
+
+
 class TestVerification:
     def test_reports_a_value_filament_db_did_not_keep(self, app):
         """Filament DB's export overrides its settings bag with structured fields such as shrinkage."""
@@ -1105,6 +1735,87 @@ class TestVerification:
         app.db.filaments[PLAIN_ID]["settings"] = {"filament_retraction_length": ["0.8"]}
         edit(app, PLAIN, filament_retraction_length="nil")
         assert app.send().message == "Sent 1 of 1 edits to Filament DB."
+
+
+class TestQuotes:
+    """Filament DB keeps a setting imported from PrusaSlicer as the text of its INI line, where quotes can
+    wrap the value. Its own fields and the lists OrcaSlicer sends hold the value itself, quotes and all."""
+
+    @pytest.mark.parametrize("settings", [{}, {"filament_vendor": '"Old"'}])
+    def test_a_field_keeps_its_quotes(self, app, settings):
+        """The field wins over INI text for the same setting in the settings bag."""
+        app.db.filaments[PLAIN_ID].update(vendor='"Maker"', settings=settings)
+        app.pull()
+        assert bundle_preset(app, "Plain PLA")["filament_vendor"] == ['"Maker"']
+
+    @pytest.mark.parametrize("stored", [['"M117 hi"'], ['"M117 hi"', "M400"]])
+    def test_a_list_from_orcaslicer_keeps_its_quotes(self, app, stored):
+        app.db.filaments[PLAIN_ID]["settings"] = {"filament_end_gcode": stored}
+        app.pull()
+        assert bundle_preset(app, "Plain PLA")["filament_end_gcode"] == stored
+
+    @pytest.mark.parametrize("stored, pulled", [
+        ('"say \\"hi\\" C:\\\\x"', ['say "hi" C:\\x']),
+        ("120 100", ["120 100"]),
+        # The export decodes a value that runs over several lines itself, and its quotes are then the text's.
+        ('"\\"a\\nb\\""', ['"a\nb"']),
+    ])
+    def test_a_prusaslicer_import_loses_the_quotes_of_its_ini_text(self, app, stored, pulled):
+        app.db.filaments[PLAIN_ID]["settings"] = {"filament_ramming_parameters": stored}
+        app.pull()
+        assert bundle_preset(app, "Plain PLA")["filament_ramming_parameters"] == pulled
+
+    def test_a_prusaslicer_name_is_translated_without_its_quotes(self, app):
+        app.db.filaments[PLAIN_ID]["settings"] = {"extrusion_multiplier": '"1.05"'}
+        app.pull()
+        assert bundle_preset(app, "Plain PLA")["filament_flow_ratio"] == ["1.05"]
+
+    def test_the_record_is_only_read_for_a_quoted_value(self, app):
+        # Without a bed temperature, no plate needs the record either.
+        del app.db.filaments[PLAIN_ID]["temperatures"]["bed"]
+        app.pull()
+        assert app.db.record_reads == 0
+        app.db.filaments[PLAIN_ID]["vendor"] = '"Maker"'
+        app.pull()
+        assert app.db.record_reads == 1
+
+    def test_a_quoted_field_is_sent_and_kept(self, app):
+        edit(app, PLAIN, filament_vendor='"\\"Maker\\""')
+        assert app.send().message == "Sent 1 of 1 edits to Filament DB."
+        assert app.db.posts == [{"vendor": '"Maker"'}]
+        assert bundle_preset(app, "Plain PLA")["filament_vendor"] == ['"Maker"']
+
+    def test_a_quoted_list_value_is_sent_and_kept(self, app):
+        edit(app, PLAIN, filament_end_gcode='"\\"M117 hi\\""')
+        assert app.send().message == "Sent 1 of 1 edits to Filament DB."
+        assert app.db.posts == [{"filament_end_gcode": ['"M117 hi"']}]
+        assert bundle_preset(app, "Plain PLA")["filament_end_gcode"] == ['"M117 hi"']
+
+    def test_an_edit_over_a_prusaslicer_import_is_no_conflict(self, app):
+        app.db.filaments[PLAIN_ID]["settings"] = {"filament_ramming_parameters": '"120 100"'}
+        edit(app, PLAIN, filament_ramming_parameters='"130 100"')
+        assert app.send().message == "Sent 1 of 1 edits to Filament DB."
+        assert app.db.posts == [{"filament_ramming_parameters": ["130 100"]}]
+
+    def test_a_one_line_value_from_a_json_import_loses_its_quotes(self, app):
+        """Filament DB's OrcaSlicer and Bambu Studio .json import (unwrap in bambuStudioImport.ts) stores a
+        one-line value as a plain string, which its settings bag cannot tell apart from INI text."""
+        app.db.filaments[PLAIN_ID]["settings"] = {"filament_notes": '"Keep dry"'}
+        app.pull()
+        assert bundle_preset(app, "Plain PLA")["filament_notes"] == ["Keep dry"]
+
+    def test_the_readback_after_a_send_removes_ini_quotes(self, app):
+        app.db.filaments[PLAIN_ID]["settings"] = {"filament_ramming_parameters": '"120 100"'}
+        edit(app, PLAIN, filament_vendor='"Maker"')
+        assert app.send().message == "Sent 1 of 1 edits to Filament DB."
+        assert bundle_preset(app, "Plain PLA")["filament_ramming_parameters"] == ["120 100"]
+
+    def test_a_quoted_field_beside_a_prusaslicer_import_keeps_its_quotes(self, app):
+        app.db.filaments[PLAIN_ID]["vendor"] = '"Maker"'
+        app.db.filaments[PLAIN_ID]["settings"] = {"filament_notes": '"a note"'}
+        app.pull()
+        preset = bundle_preset(app, "Plain PLA")
+        assert (preset["filament_vendor"], preset["filament_notes"]) == (['"Maker"'], ["a note"])
 
 
 class TestListValues:

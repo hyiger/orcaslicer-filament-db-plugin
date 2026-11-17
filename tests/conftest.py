@@ -100,6 +100,23 @@ def serialized(key, value):
     return ";".join(items)
 
 
+def decode_multiline_wire_value(value):
+    """decodeMultilineWireValue in Filament DB's src/lib/parseIni.ts. A settings string is INI text, and the
+    export decodes one only when it is a single quoted value with plain escapes that runs over several lines."""
+    quoted = re.fullmatch(r'"((?:[^"\\]|\\.)*)"', value, re.DOTALL)
+    if not quoted or not re.fullmatch(r'(?:[^\\]|\\[\\"nr])*', quoted[1], re.DOTALL):
+        return value
+    decoded = re.sub(r"\\(.)", lambda escape: {"n": "\n", "r": "\r"}.get(escape[1], escape[1]), quoted[1],
+                     flags=re.DOTALL)
+    return decoded if re.search(r"[\r\n]", decoded) else value
+
+
+def exported_setting(value):
+    """filamentToOrcaSlicerKeys in Filament DB's src/lib/orcaSlicerBundle.ts: a list from OrcaSlicer is
+    exported as it is stored, and a string, which a PrusaSlicer import leaves, as INI text."""
+    return [str(item) for item in value] if isinstance(value, list) else [decode_multiline_wire_value(value)]
+
+
 class FakePreset:
     def __init__(self, name, file="", values=None, is_dirty=False):
         self.name = name
@@ -188,6 +205,24 @@ class FakeBundles:
             self.filaments.select(selected, edits)
 
 
+def calibration_row(rows, printer, bed_type):
+    """Pick a row as src/app/api/filaments/[id]/calibration/route.ts does. A printer and a bed type only
+    put rows first, so the route falls back to a row for any printer, and then to one for any bed type."""
+    wanted = printer.strip().casefold()
+    generic = [row for row in rows if not row.get("printer")]
+    matching = [row for row in rows if wanted and (row.get("printer") or "").strip().casefold() == wanted]
+    if matching:
+        scoped = matching + generic
+    elif wanted:
+        scoped = generic or rows
+    else:
+        scoped = generic + [row for row in rows if row.get("printer")]
+    for row in scoped:
+        if bed_type and row.get("bedType") == bed_type:
+            return row
+    return next((row for row in scoped if not row.get("bedType")), scoped[0] if scoped else None)
+
+
 class FakeFilamentDb:
     """Follows src/app/api/filaments/**/route.ts in Filament DB."""
 
@@ -217,7 +252,7 @@ class FakeFilamentDb:
 
     def export(self, filament_id):
         record = self.resolved(filament_id)
-        keys = {key: list(value) for key, value in record.get("settings", {}).items()}
+        keys = {key: exported_setting(value) for key, value in record.get("settings", {}).items()}
         temperatures = record.get("temperatures", {})
         if "notes" in record and "filament_notes" not in keys:
             keys["filament_notes"] = [record["notes"]]
@@ -293,16 +328,22 @@ class FakeFilamentDb:
                 match = re.fullmatch(r"/api/filaments/([^/]+)/calibration", url.path)
                 if match:
                     rows = db.calibrations.get((match[1], query["nozzle_diameter"][0]), [])
-                    wanted = query.get("printer", [""])[0].strip().casefold()
-                    # The real route only prioritizes a printer, and falls back to any row for the nozzle.
-                    row = next((row for row in rows if (row.get("printer") or "").casefold() == wanted),
-                               rows[0] if rows else None)
+                    # high_flow filters, where the printer only prioritizes. It compares the nozzle's flag
+                    # as stored, so a nozzle saved without one matches neither high_flow=0 nor 1.
+                    if "high_flow" in query:
+                        wanted = query["high_flow"] == ["1"]
+                        rows = [row for row in rows if "highFlow" in row and row["highFlow"] == wanted]
+                    row = calibration_row(rows, query.get("printer", [""])[0], query.get("bed_type", [""])[0])
                     if row is None:
                         self.reply(404, {"error": "No calibration found"})
                     elif query.get("format") != ["orcaslicer"]:
                         self.reply(200, {"calibration": {}})
                     else:
-                        self.reply(200, {"printer": row.get("printer"), "calibration_orca": row["keys"]})
+                        # JSON leaves out a flag the nozzle does not have.
+                        nozzle = {"highFlow": row["highFlow"]} if "highFlow" in row else {}
+                        bed_type = {"name": row["bedType"], "material": "PEI"} if row.get("bedType") else None
+                        self.reply(200, {"nozzle": nozzle, "printer": row.get("printer"), "bedType": bed_type,
+                                         "calibration_orca": row["keys"]})
                 else:
                     ids = query["ids"][0].split(",") if "ids" in query else sorted(db.filaments)
                     self.reply(200, [db.export(filament_id) for filament_id in ids if filament_id in db.filaments])
@@ -413,9 +454,14 @@ def app(orca, plugin, db):
     """A running OrcaSlicer with the plugin loaded, its nozzle at 0.4 and an active user with a folder."""
     filaments = FakeFilaments()
     bundles = FakeBundles(plugin.data_dir_for_test, filaments, "cloud-user")
-    state = SimpleNamespace(nozzle="0.4")
-    bundle = SimpleNamespace(filaments=filaments, full_config_value=lambda key: state.nozzle,
-                             current_filament_preset_names=lambda: [filaments.selected.name])
+    # slots names the presets of the other filament slots, which OrcaSlicer restores by name on a reload.
+    # volume_type is the printer's nozzle_volume_type, a project setting the full config carries, and
+    # variants its extruder_variant_list, which by default offers only a standard nozzle.
+    state = SimpleNamespace(nozzle="0.4", volume_type="Standard", variants="Direct Drive Standard", slots=[])
+    config = {"nozzle_diameter": lambda: state.nozzle, "nozzle_volume_type": lambda: state.volume_type,
+              "extruder_variant_list": lambda: state.variants}
+    bundle = SimpleNamespace(filaments=filaments, full_config_value=lambda key: config[key](),
+                             current_filament_preset_names=lambda: [filaments.selected.name, *state.slots])
     orca.host.preset_bundle = lambda: bundle
     orca.host.preset.bundles = bundles
     pull_command = plugin.PullFromFilamentDb()

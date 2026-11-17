@@ -29,6 +29,8 @@ setting by setting, so a value that changed on both sides is refused rather than
 extra sync state needs to be kept. That only holds while the files match what OrcaSlicer loaded, so a
 reload that fails puts the old files back.
 """
+import functools
+import hashlib
 import http.client
 import json
 import os
@@ -125,8 +127,15 @@ PLATE_ROWS = {
     "Textured Cool Plate": ("textured_cool_plate_temp", "textured_cool_plate_temp_initial_layer"),
 }
 PLATE_ROW_KEYS = frozenset(key for keys in PLATE_ROWS.values() for key in keys)
+HOT_PLATE_KEYS = PLATE_ROWS["Hot Plate"]
+# The plate settings that take the filament's bed temperature when Filament DB has none of their own.
+PLATE_FALLBACK_KEYS = tuple(plate + suffix for plate in PLATE_KEYS for suffix in ("", "_initial_layer"))
 # These fields hold one value, and a filament with several extruder variants has one per variant.
 SINGLE_VALUE_KEYS = STRUCTURED_FIELDS.keys() | TEMPERATURE_FIELDS.keys()
+# OrcaSlicer's nozzle volume types, as Filament DB's one high-flow flag sees them. Hybrid is left out: it
+# is an extruder holding nozzles of both kinds, so it does not say which calibration a filament prints with.
+HIGH_FLOW_VOLUME_TYPES = {"Standard": False, "High Flow": True, "TPU High Flow": True, "E3D High Flow": True,
+                          "Extra High Flow": True}
 MAX_LISTED_CHANGES = 15
 MAX_SHOWN_VALUE_LENGTH = 40
 # The lists of strings in a filament preset, from OrcaSlicer's PrintConfig.cpp. The host hands values over
@@ -145,6 +154,18 @@ QUOTED_STRING = re.compile(r'"((?:[^"\\]|\\.)*)"', re.DOTALL)
 STRING_ITEM = re.compile(QUOTED_STRING.pattern + r'|([^";]*)', re.DOTALL)
 # A file name cannot hold these on every platform, and a preset takes its name from its file.
 UNSAFE_NAME_CHARACTERS = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
+# Windows opens a device for these names, also with an extension or spaces after them.
+WINDOWS_DEVICE_NAME = re.compile(r"(?:CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|COM[0-9¹²³]|LPT[0-9¹²³])(?= *(?:\.|$))",
+                                 re.IGNORECASE)
+# Common file systems allow 255 bytes in a file name, and a preset is first written to its name plus this.
+# Windows counts UTF-16 units instead, of which a name never has more than it has UTF-8 bytes.
+MAX_FILE_NAME_BYTES = 255
+TEMPORARY_SUFFIX = ".json.tmp"
+# On Windows a whole path is held to 259 UTF-16 units unless the program's manifest asks for long paths.
+# OrcaSlicer's does not, and the plugin runs inside it, so the folder takes room from the file name.
+MAX_PATH_UNITS = 259 if os.name == "nt" else None
+# The number preset_stem() puts after a file name that another filament has already.
+NUMBERED_STEM = re.compile(r".* \(([0-9]+)\)", re.DOTALL)
 # OrcaSlicer starts a new thread for every click of a Run button.
 RUN_LOCK = threading.Lock()
 # OrcaSlicer asks in the background and denies the attempt that made it ask.
@@ -155,12 +176,23 @@ class SyncError(Exception):
     """A failure to report to the user as it stands."""
 
 
+class Calibration(dict):
+    """The settings a calibration gives a preset. *every_bed* is False for one made for a single bed type,
+    whose bed temperatures are then that plate's alone."""
+
+    def __init__(self, keys=(), every_bed=True):
+        super().__init__(keys)
+        self.every_bed = every_bed
+
+
 class Api:
     def __init__(self, url, api_key, printer):
         self.url = url.rstrip("/")
         self.api_key = api_key
         self.printer = printer.strip()
         self.other_printers = set()
+        self.other_beds = set()
+        self.unknown_beds = set()
         if not self.url.startswith(("http://", "https://")):
             raise SyncError(f"The Filament DB URL must start with http:// or https://, not {url!r}.")
         self.opener = urllib.request.build_opener(SameOriginRedirects(self.url))
@@ -298,15 +330,66 @@ def find_bundle_dir():
     raise SyncError("Could not find the active user's preset folder.")
 
 
-def preset_stem(name, taken):
-    """Return a file name for the preset called *name* that does not collide with those in *taken*."""
+def utf16_units(text):
+    return len(text.encode("utf-16-le")) // 2
+
+
+def file_name_room(filament_dir):
+    """Return how many UTF-16 units a file name in *filament_dir* can have, the temporary suffix included."""
+    if MAX_PATH_UNITS is None:
+        return MAX_FILE_NAME_BYTES
+    return min(MAX_FILE_NAME_BYTES, MAX_PATH_UNITS - utf16_units(str(filament_dir)) - 1)
+
+
+def fitted(stem, name, suffix, room):
+    """Return *stem* and *suffix*, with the stem cut short if the file name would be too long.
+
+    A cut ends with a short hash of the whole *name*, so that two long names that start alike still
+    get different file names, and the same ones on every pull. The cut never splits a character.
+    """
+    def fits(text):
+        whole = text + suffix + TEMPORARY_SUFFIX
+        return len(whole.encode("utf-8")) <= MAX_FILE_NAME_BYTES and utf16_units(whole) <= room
+
+    if fits(stem):
+        return stem + suffix
+    mark = f"… {hashlib.sha256(name.encode('utf-8')).hexdigest()[:8]}"
+    # Every character takes at least a byte, so no more than this many can fit.
+    cut = stem[:MAX_FILE_NAME_BYTES]
+    while cut and not fits(cut + mark):
+        cut = cut[:-1]
+    return cut.rstrip(" .") + mark + suffix
+
+
+def safe_stem(name):
+    """Return *name* as a file name that every platform can use, before any cut or number."""
     stem = UNSAFE_NAME_CHARACTERS.sub("-", name).strip(" .") or "Filament"
-    candidate, number = stem, 1
+    if device := WINDOWS_DEVICE_NAME.match(stem):
+        stem = stem[:device.end()] + "_" + stem[device.end():]
+    return stem
+
+
+def preset_stem(name, taken, room):
+    """Return a file name for the preset called *name* that does not collide with those in *taken*."""
+    stem = safe_stem(name)
+    candidate, number = fitted(stem, name, "", room), 1
     while candidate.casefold() in taken:
         number += 1
-        candidate = f"{stem} ({number})"
-    taken.add(candidate.casefold())
+        candidate = fitted(stem, name, f" ({number})", room)
     return candidate
+
+
+def is_stem_of(stem, name, room, old_name):
+    """Return whether preset_stem() can give *name* the file name *stem*, with or without a number.
+
+    The file was named for *old_name*. A number that name had of its own, as in "PLA (2)", looks just like
+    one preset_stem() added, so only the same name, as a file name, keeps the number.
+    """
+    if not isinstance(old_name, str) or safe_stem(old_name) != safe_stem(name):
+        return False
+    numbered = NUMBERED_STEM.fullmatch(stem)
+    suffixes = ["", f" ({numbered[1]})"] if numbered else [""]
+    return any(fitted(safe_stem(name), name, suffix, room) == stem for suffix in suffixes)
 
 
 def write_file(path, data):
@@ -324,11 +407,32 @@ def write_json(path, content):
     write_file(path, json.dumps(content, indent=2, ensure_ascii=False).encode("utf-8"))
 
 
-def preset_files(profiles):
-    """Return {stem: profile}. Going by id keeps a stem with its filament when others come and go."""
-    taken = set()
-    return {preset_stem(profile["name"], taken): profile
-            for profile in sorted(profiles, key=lambda profile: profile["filament_id"])}
+def preset_files(profiles, filament_dir, previous, in_use):
+    """Return {stem: profile}, given the bundle's *previous* {stem: profile} and the stems *in_use* by a slot.
+
+    OrcaSlicer restores the preset of every filament slot by name, and a preset's name is its file name, so
+    a file name that went to another filament would quietly put that filament in the slot. A filament
+    keeps its file name for as long as its name gives it, number included, so that another one coming or
+    going does not move it. A new name goes by id, and never takes a file name that a slot holds for
+    another filament: that slot then gets another preset, and the pull says so.
+    """
+    room = file_name_room(filament_dir)
+    old_stems = {profile.get("filament_id"): (stem, profile.get("name")) for stem, profile in previous.items()}
+    held = {stem.casefold(): profile.get("filament_id") for stem, profile in previous.items() if stem in in_use}
+    presets, unplaced = {}, []
+    for profile in sorted(profiles, key=lambda profile: profile["filament_id"]):
+        stem, old_name = old_stems.get(profile["filament_id"], (None, None))
+        if stem is not None and is_stem_of(stem, profile["name"], room, old_name):
+            presets[stem] = profile
+        else:
+            unplaced.append(profile)
+    taken = {stem.casefold() for stem in presets}
+    for profile in unplaced:
+        others = {stem for stem, filament_id in held.items() if filament_id != profile["filament_id"]}
+        stem = preset_stem(profile["name"], taken | others, room)
+        taken.add(stem.casefold())
+        presets[stem] = profile
+    return presets
 
 
 def write_bundle(bundle_dir, presets):
@@ -381,14 +485,57 @@ def read_bundle(bundle_dir):
             for path in (bundle_dir / "filament").glob("*.json")}
 
 
+def read_pulled(bundle_dir):
+    """Return {stem: profile} for the presets of the bundle that can be read.
+
+    A pull replaces or removes every file, so one it cannot read, such as a half-saved hand edit, is
+    left for it to fix rather than stopping it.
+    """
+    pulled = {}
+    for path in (bundle_dir / "filament").glob("*.json"):
+        try:
+            profile = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(profile, dict):
+            pulled[path.stem] = profile
+    return pulled
+
+
 def active_nozzle(bundle):
+    """Return the first extruder's nozzle diameter, and whether that nozzle is a high-flow one."""
     value = bundle.full_config_value("nozzle_diameter") or ""
     nozzle = re.split("[,;]", value)[0].strip()
     try:
         float(nozzle)
     except ValueError:
         raise SyncError(f"Could not read the printer's nozzle diameter from {value!r}.") from None
-    return nozzle
+    return nozzle, high_flow(bundle)
+
+
+def high_flow(bundle):
+    """Return whether the first extruder's nozzle is a high-flow one, or None if the printer cannot say.
+
+    A filament can have a standard and a high-flow row for the same diameter on the same printer, and
+    without saying which, Filament DB answers with either.
+    """
+    volume_type = (bundle.full_config_value("nozzle_volume_type") or "").split(",")[0].strip()
+    # Hybrid holds nozzles of both kinds, so it says nothing either, nor does a type this does not know.
+    if volume_type not in HIGH_FLOW_VOLUME_TYPES:
+        return None
+    if HIGH_FLOW_VOLUME_TYPES[volume_type] or offers_high_flow(bundle):
+        return HIGH_FLOW_VOLUME_TYPES[volume_type]
+    # Profiles such as Prusa's HF nozzles do not list a high-flow variant, so OrcaSlicer leaves their volume
+    # type at Standard and offers no other. Standard says nothing about such a nozzle.
+    return None
+
+
+def offers_high_flow(bundle):
+    """Return whether OrcaSlicer lets the first extruder's volume type be set to a high-flow one."""
+    value = bundle.full_config_value("extruder_variant_list") or ""
+    # Each extruder has one value, its variants such as "Direct Drive High Flow" with commas between them.
+    variants = (string_list(value) or [""])[0].split(",")
+    return any(variant.strip().endswith(" High Flow") for variant in variants)
 
 
 def bare_id(filament_id):
@@ -396,22 +543,75 @@ def bare_id(filament_id):
 
 
 def fetch_calibration(api, filament_id, nozzle):
-    """Return the calibration for the nozzle, leaving out one that belongs to another printer.
+    """Return the calibration for the nozzle, leaving out one that belongs to another printer, and
+    keeping one made for a single bed type to that bed's plate.
 
     The route falls back to any row for the nozzle, and a machine's retraction, temperatures and
     chamber settings do not carry over to another one.
     """
-    path = f"/api/filaments/{bare_id(filament_id)}/calibration?nozzle_diameter={nozzle}&format=orcaslicer"
+    diameter, is_high_flow = nozzle
+    path = f"/api/filaments/{bare_id(filament_id)}/calibration?nozzle_diameter={diameter}&format=orcaslicer"
     if api.printer:
         path += "&printer=" + urllib.parse.quote(api.printer)
-    result = api.request(path, missing_ok=True)
+    result = request_calibration(api, path, is_high_flow)
     if not result:
-        return {}
+        return Calibration()
+    ours = of_this_printer(api, result)
+    if ours and not result.get("bedType"):
+        return Calibration(result.get("calibration_orca", {}))
+    # Filament DB answers with a row for one bed type only when the filament has none for every bed type,
+    # and then with the first one. Each other plate's row has to be asked for by name. With no printer set,
+    # it also puts another printer's row for every bed type ahead of a row for any printer made for one,
+    # so then every plate's row has to be asked for.
+    calibration = scoped_to_bed(api, result) if ours else Calibration(every_bed=False)
+    answered = result["bedType"]["name"] if ours else None
+    for bed_type in [name for name in PLATE_ROWS if name != answered]:
+        row = request_calibration(api, f"{path}&bed_type={urllib.parse.quote(bed_type)}", is_high_flow)
+        # The route falls back to another bed type's row when this one has none.
+        if ((row or {}).get("bedType") or {}).get("name") == bed_type and of_this_printer(api, row):
+            calibration.update(scoped_to_bed(api, row))
+    return calibration
+
+
+def of_this_printer(api, result):
+    """Return whether the route's answer is a calibration for any printer or for this one."""
     printer = result.get("printer")
     if printer is None or printer.casefold() == api.printer.casefold():
-        return result.get("calibration_orca", {})
+        return True
     api.other_printers.add(printer)
-    return {}
+    return False
+
+
+def scoped_to_bed(api, result):
+    """Return the settings of a calibration made for a single bed type, kept to that bed's plate.
+
+    A preset has a bed temperature for each plate but one value for everything else, so only the bed
+    temperatures can stay with their plate, and none can when OrcaSlicer has no plate by that name.
+    """
+    keys = result.get("calibration_orca", {})
+    bed_type = result["bedType"]["name"]
+    if bed_type not in PLATE_ROWS:
+        api.unknown_beds.add(bed_type)
+        return Calibration(every_bed=False)
+    kept = {plate_key: keys[key] for key, plate_key in zip(HOT_PLATE_KEYS, PLATE_ROWS[bed_type]) if key in keys}
+    if len(kept) < len(keys):
+        api.other_beds.add(bed_type)
+    return Calibration(kept, every_bed=False)
+
+
+def request_calibration(api, path, is_high_flow):
+    """Return the route's answer for the kind of nozzle, or None if it has no row for it."""
+    if is_high_flow is None:
+        return api.request(path, missing_ok=True)
+    result = api.request(f"{path}&high_flow={int(is_high_flow)}", missing_ok=True)
+    if result or is_high_flow:
+        return result
+    # A nozzle saved without a high-flow flag matches neither high_flow=0 nor 1, though Filament DB
+    # counts it as standard. Ask again without the flag, and keep only a row that is not high flow.
+    result = api.request(path, missing_ok=True)
+    if result and (result.get("nozzle") or {}).get("highFlow") is True:
+        return None
+    return result
 
 
 def unescaped(text):
@@ -424,6 +624,30 @@ def unquoted(value):
     return [unescaped(quoted[1]) if (quoted := QUOTED_STRING.fullmatch(item)) else item for item in value]
 
 
+def record_reader(api, profile):
+    """Return a function that reads the filament's record from Filament DB the first time it is called."""
+    return functools.cache(lambda: api.request(f"/api/filaments/{bare_id(profile['filament_id'])}"))
+
+
+def ini_keys(profile, record):
+    """Return the settings whose exported value is the text of a PrusaSlicer INI line, quotes and all.
+
+    Filament DB keeps such a setting as a string in its settings bag, and its own fields and the lists sent
+    from OrcaSlicer as the value itself, where a quote is part of the value. The export makes a list of
+    every one of them, so only the record tells them apart, and it is only read when a value is quoted.
+    Its OrcaSlicer and Bambu Studio .json import also stores a one-line value as a string, and the bag
+    does not say where a string came from, so Filament DB treats every string as INI text and so does this.
+    """
+    quoted = [key for key, value in profile.items()
+              if isinstance(value, list) and len(value) == 1 and QUOTED_STRING.fullmatch(value[0])]
+    if not quoted:
+        return set()
+    settings = record().get("settings") or {}
+    # The export decodes INI text that runs over several lines itself, and a field wins over the
+    # settings bag, so only a value exported just as the string is stored is still INI text.
+    return {key for key in quoted if isinstance(settings.get(key), str) and profile[key] == [settings[key]]}
+
+
 def orca_z_shrinkage(value):
     """Convert Filament DB's shrinkage, 0.2 for 0.2%, to Orca's remaining size of 99.8%.
 
@@ -434,52 +658,100 @@ def orca_z_shrinkage(value):
     return [f"{round(number if number >= 50 else 100 - number, 4):g}%" for number in numbers]
 
 
-def prepare_profile(profile, calibration, filament_keys):
+def bag_value(value):
+    """Return a value from Filament DB's settings bag as its export gives it, without the INI quotes."""
+    return [str(item) for item in value] if isinstance(value, list) else unquoted([str(value)])
+
+
+def own_bed_temperatures(settings, record):
+    """Return the filament's own bed temperatures, which a plate without one of its own takes.
+
+    The export puts a Hot Plate row over them, and that value is the Hot Plate's alone. Only the record
+    says whether there is such a row, so it is read only when a plate needs the value.
+    """
+    own = {key: settings[key] for key in HOT_PLATE_KEYS if key in settings}
+    if not own or all(key in settings for key in PLATE_FALLBACK_KEYS):
+        return own
+    filament = record()
+    temperatures = filament.get("temperatures") or {}
+    bag = filament.get("settings") or {}
+    for key in own.keys() & row_keys(filament):
+        # What the export gives without the row: the temperature field, or else the settings bag.
+        if temperatures.get(TEMPERATURE_FIELDS[key]) not in (None, ""):
+            own[key] = [str(temperatures[TEMPERATURE_FIELDS[key]])]
+        elif bag.get(key) is not None:
+            own[key] = bag_value(bag[key])
+        else:
+            del own[key]
+    return own
+
+
+def prepare_profile(profile, calibration, filament_keys, record):
     """Turn an exported profile into a preset that a live reload accepts.
 
     A reload refuses the whole bundle over one invalid preset, and a preset is invalid if it holds a
     known setting that does not belong in a filament preset. Filament DB's settings bag can hold
     anything, such as PrusaSlicer keys, so only the keys of a filament preset are kept. The same goes
     for "nil", which means not overridden, is refused by many settings, and is what leaving one out does.
+    Settings that are PrusaSlicer INI text lose its quoting. *record* reads the filament's record.
     """
-    settings = dict(profile)
+    ini = ini_keys(profile, record)
+    settings = {key: unquoted(value) if key in ini else value for key, value in profile.items()}
     if "filament_colour" in settings:
         settings["default_filament_colour"] = settings.pop("filament_colour")
     for prusaslicer_key, orca_key in PRUSASLICER_KEYS.items():
         if prusaslicer_key in settings:
             settings.setdefault(orca_key, settings[prusaslicer_key])
+    beds = own_bed_temperatures(settings, record)
     settings.update(calibration)
+    if calibration.every_bed:
+        beds.update({key: calibration[key] for key in HOT_PLATE_KEYS if key in calibration})
+    # A calibrated plate's first layer follows its calibrated bed temperature, as the Hot Plate's does
+    # below, unless the filament has a first layer temperature of its own.
+    for temperature_key, first_layer_key in PLATE_ROWS.values():
+        if temperature_key in calibration:
+            settings.setdefault(first_layer_key, beds.get(HOT_PLATE_KEYS[1], calibration[temperature_key]))
     if "pressure_advance" in calibration:
         settings["enable_pressure_advance"] = ["1"]
     # PrusaSlicer's 0 means no limit. OrcaSlicer turns it into 0.5 when the preset is selected, as an
     # edit the user never made, and Send would write that back.
     if same_value(settings.get(MAX_VOLUMETRIC_SPEED_KEY), ["0"]):
         del settings[MAX_VOLUMETRIC_SPEED_KEY]
-    if "hot_plate_temp" in settings:
-        settings.setdefault("hot_plate_temp_initial_layer", settings["hot_plate_temp"])
+    for temperatures in (settings, beds):
+        if "hot_plate_temp" in temperatures:
+            temperatures.setdefault("hot_plate_temp_initial_layer", temperatures["hot_plate_temp"])
     for plate in PLATE_KEYS:
         for suffix in ("", "_initial_layer"):
-            if "hot_plate_temp" + suffix in settings:
-                settings.setdefault(plate + suffix, settings["hot_plate_temp" + suffix])
+            if "hot_plate_temp" + suffix in beds:
+                settings.setdefault(plate + suffix, beds["hot_plate_temp" + suffix])
     if settings.get(Z_SHRINKAGE_KEY) not in (None, ["nil"]):
-        settings[Z_SHRINKAGE_KEY] = orca_z_shrinkage(unquoted(settings[Z_SHRINKAGE_KEY]))
+        settings[Z_SHRINKAGE_KEY] = orca_z_shrinkage(settings[Z_SHRINKAGE_KEY])
 
     prepared = {key: profile[key] for key in METADATA_KEYS if key in profile}
     prepared["version"] = PRESET_VERSION
-    prepared.update({key: unquoted(value) for key, value in settings.items()
+    prepared.update({key: value for key, value in settings.items()
                      if key in filament_keys - SCOPE_KEYS and value != ["nil"]})
     return prepared
 
 
 def fetch_profiles(api, nozzle, filament_keys):
-    return [prepare_profile(profile, fetch_calibration(api, profile["filament_id"], nozzle), filament_keys)
+    return [prepare_profile(profile, fetch_calibration(api, profile["filament_id"], nozzle), filament_keys,
+                            record_reader(api, profile))
             for profile in api.request("/api/filaments/orcaslicer")]
 
 
+def exports_of(api, filament_id):
+    """Return the export of one filament, an empty list if Filament DB no longer has it."""
+    return api.request("/api/filaments/orcaslicer?ids=" + urllib.parse.quote(bare_id(filament_id)))
+
+
 def fetch_export(api, filament_id):
-    exported = api.request("/api/filaments/orcaslicer?ids=" + urllib.parse.quote(bare_id(filament_id)))
+    exported = exports_of(api, filament_id)
     if not exported:
-        raise SyncError("Filament DB no longer has this filament. Run Pull from Filament DB to remove it.")
+        # Pull refuses to remove a preset that has unsent edits, so they have to go first. A plugin pointed at
+        # the wrong copy of Filament DB gets the same answer, and there the edits are worth keeping.
+        raise SyncError(f"Filament DB at {api.url} does not have this filament. If that is the right address, "
+                        "discard the edits to it, then run Pull from Filament DB to remove its synced preset.")
     return exported[0]
 
 
@@ -594,11 +866,30 @@ def refuse_moved_edits(edited, presets):
         kept = presets.get(edited.name.removeprefix(BUNDLE_PRESET_PREFIX))
         if kept and kept["filament_id"] == filament_id:
             return
+        # A rename in Filament DB is not the only cause: a name an earlier version could not use everywhere,
+        # or a Windows folder path that grew, moves the file too.
         if any(profile["filament_id"] == filament_id for profile in presets.values()):
-            raise SyncError(f'"{display_name(edited)}" has unsent edits, and it was renamed in Filament DB. '
-                            "Send or discard them, then pull again. Nothing was changed.")
+            raise SyncError(f'"{display_name(edited)}" has unsent edits, and this pull gives its preset a new '
+                            "name. Send or discard them, then pull again. Nothing was changed.")
         raise SyncError(f'"{display_name(edited)}" has unsent edits, and it was removed from Filament DB. '
                         "Discard them, then pull again. Nothing was changed.")
+
+
+def confirm_empty(api, bundle_dir):
+    """Ask before an empty export removes every synced preset.
+
+    An empty export is what deleting the last filament gives, but also what a plugin pointed at the wrong
+    copy of Filament DB gets. This comes before the check for unsent edits, which tells the user to
+    discard them, and that is the wrong advice when the copy is the wrong one.
+    """
+    count = len(list((bundle_dir / "filament").glob("*.json")))
+    if not count:
+        return
+    presets = "the 1 synced preset" if count == 1 else f"all {count} synced presets"
+    question = (f"Filament DB at {api.url} has no filaments. Remove {presets} from OrcaSlicer?\n\n"
+                "Press Cancel if the plugin is pointing at the wrong copy of Filament DB.")
+    if not confirmed(question, PULL_NAME):
+        raise SyncError("Filament DB has no filaments, and the synced presets were left alone.")
 
 
 def pull(api):
@@ -607,32 +898,42 @@ def pull(api):
     nozzle = active_nozzle(bundle)
     profiles = fetch_profiles(api, nozzle, set(filaments.edited_preset().config_keys()))
     bundle_dir = find_bundle_dir()
-    if not profiles and any((bundle_dir / "filament").glob("*.json")):
-        raise SyncError("Filament DB has no filaments, so the synced presets were left alone. "
-                        "Check that the plugin is pointing at the right copy.")
+    if not profiles:
+        confirm_empty(api, bundle_dir)
 
-    presets = preset_files(profiles)
+    in_use = {name.removeprefix(BUNDLE_PRESET_PREFIX) for name in bundle.current_filament_preset_names()
+              if name.startswith(BUNDLE_PRESET_PREFIX)}
+    presets = preset_files(profiles, bundle_dir / "filament", read_pulled(bundle_dir), in_use)
     refuse_moved_edits(filaments.edited_preset(), presets)
-    replaced = sorted(name.removeprefix(BUNDLE_PRESET_PREFIX) for name in set(bundle.current_filament_preset_names())
-                      if name.startswith(BUNDLE_PRESET_PREFIX)
-                      and name.removeprefix(BUNDLE_PRESET_PREFIX) not in presets)
+    replaced = sorted(in_use - presets.keys())
     install_bundle(bundle_dir, presets)
 
-    message = f"Pulled {len(profiles)} filaments from Filament DB for a {nozzle} mm nozzle."
+    diameter, is_high_flow = nozzle
+    kind = "high-flow nozzle" if is_high_flow else "nozzle"
+    message = f"Pulled {len(profiles)} filaments from Filament DB for a {diameter} mm {kind}."
     if replaced:
         message += f" These were removed, so OrcaSlicer chose other presets for them: {key_list(replaced)}."
     if api.other_printers:
         message += f" Calibration tied to other printers was left out: {key_list(api.other_printers)}."
+    if api.other_beds:
+        message += (" Calibration tied to one bed type was left out, other than any bed temperature for its "
+                    f"plate: {key_list(api.other_beds)}.")
+    if api.unknown_beds:
+        message += (" Calibration for a bed type OrcaSlicer has no plate for was left out: "
+                    f"{key_list(api.unknown_beds)}.")
     return message
 
 
 def plate_row_keys(api, filament_id):
-    """Return the plate settings that Filament DB's bed type rows give this filament.
+    return row_keys(api.request(f"/api/filaments/{bare_id(filament_id)}"))
+
+
+def row_keys(record):
+    """Return the plate settings that Filament DB's bed type rows give the filament of *record*.
 
     The record lists a variant's rows as the export uses them, which are its parent's when it has none of
     its own. The export skips an empty value, so that setting still comes from the settings bag.
     """
-    record = api.request(f"/api/filaments/{bare_id(filament_id)}")
     return {key for row in record.get("bedTypeTemps") or []
             for field, key in zip(("temperature", "firstLayerTemperature"), PLATE_ROWS.get(row.get("bedType"), ()))
             if row.get(field) not in (None, "")}
@@ -669,7 +970,7 @@ def fetch_theirs(api, filament_id, nozzle, filament_keys):
     """Return Filament DB's export of the filament, its calibration for the nozzle, and the preset they make."""
     exported = fetch_export(api, filament_id)
     calibration = fetch_calibration(api, filament_id, nozzle)
-    return exported, calibration, prepare_profile(exported, calibration, filament_keys)
+    return exported, calibration, prepare_profile(exported, calibration, filament_keys, record_reader(api, exported))
 
 
 def held_back_keys(api, filament_id, changes, calibration):
@@ -715,7 +1016,8 @@ def load_back(api, filament_id, calibration, filament_keys, bundle_dir, presets,
     edit to one of them reads as a change made in Filament DB until a pull catches the bundle up.
     """
     try:
-        theirs = prepare_profile(fetch_export(api, filament_id), calibration, filament_keys)
+        exported = fetch_export(api, filament_id)
+        theirs = prepare_profile(exported, calibration, filament_keys, record_reader(api, exported))
         install_bundle(bundle_dir, {**presets, stem: theirs})
     except Exception as error:
         raise SyncError(f"These edits were saved in Filament DB, but OrcaSlicer could not load them back: "
@@ -754,6 +1056,11 @@ def send(api):
     presets = read_bundle(bundle_dir)
     stem = next((stem for stem, profile in presets.items() if profile["filament_id"] == filament_id), None)
     if stem is None:
+        # A pull removes a filament's synced preset once Filament DB drops it, but a saved copy stays,
+        # and telling the user to pull again would send them round in circles.
+        if not exports_of(api, filament_id):
+            raise SyncError(f'"{display_name(edited)}" came from a filament that Filament DB at {api.url} does '
+                            "not have, so there is nowhere to send it.")
         raise SyncError("This filament has not been pulled yet. Run Pull from Filament DB first.")
     ancestor = presets[stem]
 

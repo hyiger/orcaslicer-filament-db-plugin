@@ -695,11 +695,20 @@ def send(api):
                         "Run Pull from Filament DB to see its values, then send again.")
     if edited.name != BUNDLE_PRESET_PREFIX + stem:
         # A saved copy stays as it was when a pull moves the bundle on, so the bundle says nothing
-        # about what the user could see when making this edit.
+        # about what the user could see when making this edit. A setting Filament DB leaves out is not
+        # a missing value: the synced preset shows OrcaSlicer's own for it, and a copy saved before an
+        # override was removed still shows the old one.
+        synced = filaments.find_preset(BUNDLE_PRESET_PREFIX + stem)
+        # The bundle's files can be on disk without OrcaSlicer having loaded them, and then there is
+        # nothing to compare the copy with.
+        if synced is None:
+            raise SyncError("Nothing was sent, because OrcaSlicer has not loaded this filament's synced preset. "
+                            "Run Pull from Filament DB, then send again.")
         hidden = [key for key in sendable
-                  if key in theirs and not same_value(theirs[key], decode_value(key, selected.config_value(key) or ""))]
+                  if not same_value(theirs[key] if key in theirs else decode_value(key, synced.config_value(key) or ""),
+                                    decode_value(key, selected.config_value(key) or ""))]
         if hidden:
-            raise SyncError(f"Nothing was sent, because Filament DB holds other values for: {key_list(hidden)}. "
+            raise SyncError(f"Nothing was sent, because the synced preset shows other values for: {key_list(hidden)}. "
                             "Make the change on the synced preset instead.")
 
     if sendable:

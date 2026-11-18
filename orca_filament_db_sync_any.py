@@ -6,7 +6,7 @@
 # name = "Filament DB Sync"
 # description = "Keeps OrcaSlicer's filament presets in step with Filament DB, in both directions."
 # author = "hyiger"
-# version = "0.1.1"
+# version = "0.2.0"
 # type = "script"
 # ///
 """Filament DB Sync -- two-way sync of filament presets between OrcaSlicer and Filament DB.
